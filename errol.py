@@ -157,7 +157,10 @@ def load_config() -> dict:
     }
 
 def select_model(config: dict, router: Router, task: str, available: list) -> str:
-    """Ask user to select a model."""
+    """Ask user to select a model with countdown auto-select."""
+    import termios
+    import tty
+
     # Get suggested model from router
     suggested, category = router.classify(task)
     models = config["models"]
@@ -166,21 +169,46 @@ def select_model(config: dict, router: Router, task: str, available: list) -> st
     print(f"  [1] {models['small']} (small - fast)")
     print(f"  [2] {models['medium']} (medium)")
     print(f"  [3] {models['large']} (large - powerful)")
-    print(f"  [Enter] Use suggested")
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
 
     try:
-        choice = input("Choice [1/2/3/Enter]: ").strip()
-    except EOFError:
-        choice = ""
-
-    if choice == "1":
-        return models["small"]
-    elif choice == "2":
-        return models["medium"]
-    elif choice == "3":
-        return models["large"]
-    else:
+        tty.setcbreak(fd)
+        for i in range(3, 0, -1):
+            print(f"\rChoice [1/2/3]: auto-select in {i}s ", end="", flush=True)
+            ready, _, _ = select.select([sys.stdin], [], [], 1.0)
+            if ready:
+                ch = sys.stdin.read(1)
+                print()  # newline
+                if ch == "1":
+                    return models["small"]
+                elif ch == "2":
+                    return models["medium"]
+                elif ch == "3":
+                    return models["large"]
+                else:
+                    return suggested
+        print("\r" + " " * 40 + "\r", end="", flush=True)
         return suggested
+    except (termios.error, OSError):
+        # Fallback for non-TTY (e.g., piped input)
+        try:
+            choice = input("Choice [1/2/3/Enter]: ").strip()
+        except EOFError:
+            choice = ""
+        if choice == "1":
+            return models["small"]
+        elif choice == "2":
+            return models["medium"]
+        elif choice == "3":
+            return models["large"]
+        return suggested
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except (termios.error, OSError):
+            pass
 
 def preview_file_change(name: str, args: dict) -> str:
     """Generate a diff preview for file operations."""

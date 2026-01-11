@@ -34,12 +34,12 @@ def show_diff(old: str, new: str, path: str) -> str:
 def read_file(path: str, offset: int = None, limit: int = None) -> str:
     """Read a file with optional line offset and limit."""
     try:
-        # Handle None values and string conversions from JSON
-        if offset is None:
+        # Handle None, "null" string, and type conversions from JSON
+        if offset is None or offset == "null":
             offset = 0
         else:
             offset = int(offset)
-        if limit is None:
+        if limit is None or limit == "null":
             limit = 2000
         else:
             limit = int(limit)
@@ -57,9 +57,13 @@ def read_file(path: str, offset: int = None, limit: int = None) -> str:
     except Exception as e:
         return f"Error reading file: {e}"
 
-def write_file(path: str, content: str) -> str:
+def write_file(path: str = None, content: str = None) -> str:
     """Write content to a file."""
     try:
+        if not path:
+            return "Error: 'path' parameter is required"
+        if content is None:
+            return "Error: 'content' parameter is required (the text to write to the file)"
         p = Path(path).expanduser().resolve()
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
@@ -67,9 +71,15 @@ def write_file(path: str, content: str) -> str:
     except Exception as e:
         return f"Error writing file: {e}"
 
-def edit_file(path: str, old_string: str, new_string: str) -> str:
+def edit_file(path: str = None, old_string: str = None, new_string: str = None) -> str:
     """Replace old_string with new_string in file."""
     try:
+        if not path:
+            return "Error: 'path' parameter is required"
+        if old_string is None:
+            return "Error: 'old_string' parameter is required (the text to find and replace)"
+        if new_string is None:
+            return "Error: 'new_string' parameter is required (the replacement text)"
         p = Path(path).expanduser().resolve()
         if not p.exists():
             return f"Error: File not found: {path}"
