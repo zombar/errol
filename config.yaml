@@ -1,0 +1,11 @@
+ollama:
+  host: http://localhost:11434
+  timeout: 300
+
+models:
+  small: qwen2.5:3b
+  medium: qwen2.5:7b
+  large: qwen2.5-coder:14b
+
+agent:
+  max_turns: 20
