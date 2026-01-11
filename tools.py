@@ -31,9 +31,15 @@ def show_diff(old: str, new: str, path: str) -> str:
 
     return "\n".join(result)
 
-def read_file(path: str, offset: int = 0, limit: int = 2000) -> str:
+def read_file(path: str, offset: int = None, limit: int = None) -> str:
     """Read a file with optional line offset and limit."""
     try:
+        # Handle None values from JSON null
+        if offset is None:
+            offset = 0
+        if limit is None:
+            limit = 2000
+
         p = Path(path).expanduser().resolve()
         if not p.exists():
             return f"Error: File not found: {path}"

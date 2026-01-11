@@ -17,7 +17,7 @@ PATTERNS = {
     "large": [
         r"\bcreate\b", r"\bimplement\b", r"\bbuild\b", r"\bwrite\b",
         r"\brefactor\b", r"\bgenerate\b", r"\badd feature\b", r"\bnew\b",
-        r"\bfix\b", r"\bdebug\b", r"\boptimize\b"
+        r"\bfix\b", r"\bdebug\b", r"\boptimize\b", r"\bdocument", r"\bcomprehensive\b"
     ]
 }
 
@@ -41,11 +41,11 @@ class Router:
 
     def classify(self, task: str) -> Tuple[str, str]:
         """Classify task and return (model_name, category)."""
-        # Try pattern matching first
+        # Try pattern matching first (check large→medium→small so complex tasks aren't downgraded)
         task_lower = task.lower()
 
-        for tier, patterns in PATTERNS.items():
-            for pattern in patterns:
+        for tier in ("large", "medium", "small"):
+            for pattern in PATTERNS[tier]:
                 if re.search(pattern, task_lower):
                     return self.models[tier], tier
 

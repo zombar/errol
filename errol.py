@@ -13,10 +13,50 @@ import typer
 from pathlib import Path
 from typing import Optional
 
+import re
+import select
 from llm import OllamaClient
+
+# Read-only tools that auto-execute after countdown
+READONLY_TOOLS = ("read_file", "glob")
 from router import Router
 from tools import execute_tool, get_tool_schemas, TOOLS
 from todos import TodoManager
+from orchestrator import plan_task, display_plan, confirm_plan, edit_plan
+from worker import execute_task, work_all
+
+
+def parse_tool_calls_from_text(text: str) -> list[dict]:
+    """Extract first valid tool call from JSON in text (fallback for models without native tool support)."""
+    # Try to find JSON in code blocks first
+    code_block_pattern = r'```(?:json)?\s*(\{[\s\S]*?\})\s*```'
+    matches = re.findall(code_block_pattern, text)
+
+    # Also try to find bare JSON objects
+    if not matches:
+        bare_json_pattern = r'(\{\s*"name"\s*:[\s\S]*?"arguments"\s*:[\s\S]*?\})'
+        matches = re.findall(bare_json_pattern, text)
+
+    for match in matches:
+        try:
+            obj = json.loads(match)
+            if "name" in obj and "arguments" in obj:
+                args = obj["arguments"]
+                # Skip if arguments contain placeholders
+                args_str = json.dumps(args)
+                if '<' in args_str and '>' in args_str:
+                    continue
+                # Return first valid tool call only
+                return [{
+                    "function": {
+                        "name": obj["name"],
+                        "arguments": args
+                    }
+                }]
+        except json.JSONDecodeError:
+            continue
+
+    return []
 
 app = typer.Typer(help="Errol - MoE local LLM coding agent")
 
@@ -57,6 +97,11 @@ You have access to these tools:
 - edit_file: Edit files (find/replace unique strings)
 - bash: Run shell commands
 - glob: Find files by pattern
+
+IMPORTANT - How to use tools:
+- Call ONE tool at a time and wait for the result before calling the next
+- Never use placeholders like <file-path> - use actual values from previous results
+- After each tool call, you will receive the result, then decide what to do next
 
 Guidelines:
 - ALWAYS read files before editing or overwriting them
@@ -130,6 +175,29 @@ def preview_file_change(name: str, args: dict) -> str:
 
     return ""
 
+def countdown_confirm(seconds: int = 3) -> bool:
+    """Auto-confirm after countdown, allow 'n' to cancel."""
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+
+    try:
+        tty.setcbreak(fd)  # Don't wait for Enter
+        for i in range(seconds, 0, -1):
+            print(f"\rAuto-execute in {i}s [n to cancel, Enter to run now] ", end="", flush=True)
+            ready, _, _ = select.select([sys.stdin], [], [], 1.0)
+            if ready:
+                ch = sys.stdin.read(1).lower()
+                print()  # newline
+                return ch != 'n'
+        print("\r" + " " * 50 + "\r", end="", flush=True)  # Clear line
+        return True
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
 def confirm_tool(name: str, args: dict) -> bool:
     """Ask user to confirm tool execution, showing diff for file changes."""
     print(f"\n{'='*60}")
@@ -154,6 +222,10 @@ def confirm_tool(name: str, args: dict) -> bool:
         print(f"Args: {args_preview}")
 
     print(f"{'='*60}")
+
+    # Auto-confirm read-only tools with countdown
+    if name in READONLY_TOOLS:
+        return countdown_confirm()
 
     try:
         confirm = input("Execute? [y/N]: ").strip().lower()
@@ -205,34 +277,24 @@ def agent_loop(task: str, config: dict, todos: TodoManager):
     timer = Timer()
 
     for turn in range(max_turns):
-        # Get response with streaming and timer
+        # Get response (non-streaming for reliable tool calls)
         full_content = ""
         tool_calls = []
-        first_token = True
 
         timer.start()
+        response = client.chat_sync(model, messages, tools=tools)
+        timer.stop()
+        elapsed = time.time() - timer.start_time
 
-        for chunk in client.chat(model, messages, tools=tools, stream=True):
-            if first_token:
-                timer.stop()
-                print("[errol] ", end="", flush=True)
-                first_token = False
+        msg = response.get("message", {})
+        full_content = msg.get("content", "")
+        tool_calls = msg.get("tool_calls", [])
 
-            msg = chunk.get("message", {})
+        # Fallback: parse tool calls from text if model doesn't use native format
+        if not tool_calls and full_content:
+            tool_calls = parse_tool_calls_from_text(full_content)
 
-            # Stream text content
-            if "content" in msg and msg["content"]:
-                print(msg["content"], end="", flush=True)
-                full_content += msg["content"]
-
-            # Collect tool calls
-            if "tool_calls" in msg:
-                tool_calls.extend(msg["tool_calls"])
-
-        if first_token:  # No response received
-            timer.stop()
-
-        print()  # Newline after response
+        print(f"[errol {elapsed:.1f}s] {full_content}")
 
         # Add assistant message to history
         assistant_msg = {"role": "assistant", "content": full_content}
@@ -303,18 +365,20 @@ def chat(task: Optional[str] = typer.Argument(None, help="Task to perform")):
 
 @app.command()
 def todo(
-    action: str = typer.Argument(..., help="add|list|done|start|rm|clear"),
-    content: Optional[str] = typer.Argument(None, help="Todo content or ID")
+    action: str = typer.Argument(..., help="add|list|show|done|start|rm|clear|clearall"),
+    content: Optional[str] = typer.Argument(None, help="Todo content or ID"),
+    tier: Optional[str] = typer.Option(None, "--tier", "-t", help="Task tier: small|medium|large")
 ):
-    """Manage todos: add, list, done, start, rm, clear"""
+    """Manage todos: add, list, show, done, start, rm, clear, clearall"""
     todos = TodoManager()
 
     if action == "add":
         if not content:
-            print("Usage: errol todo add 'task description'")
+            print("Usage: errol todo add 'task description' [--tier small|medium|large]")
             return
-        id = todos.add(content)
-        print(f"Added todo {id}: {content}")
+        task_tier = tier or "medium"
+        id = todos.add(content, tier=task_tier)
+        print(f"Added todo {id} ({task_tier}): {content}")
 
     elif action == "list":
         items = todos.list(status=content)  # content can be status filter
@@ -323,8 +387,35 @@ def todo(
         else:
             for item in items:
                 status = item["status"]
-                marker = {"pending": "[ ]", "in_progress": "[>]", "complete": "[x]"}[status]
-                print(f"{marker} {item['id']}: {item['content']}")
+                marker = {"pending": "[ ]", "in_progress": "[>]", "complete": "[x]", "blocked": "[!]"}.get(status, "[ ]")
+                task_tier = item.get("tier", "medium")
+                tier_marker = {"small": "S", "medium": "M", "large": "L"}.get(task_tier, "M")
+                deps = item.get("dependencies", [])
+                dep_str = f" [deps: {','.join(deps)}]" if deps else ""
+                print(f"{marker} [{tier_marker}] {item['id']}: {item['content']}{dep_str}")
+
+    elif action == "show":
+        if not content:
+            print("Usage: errol todo show <id>")
+            return
+        item = todos.get(content)
+        if not item:
+            print(f"Todo {content} not found")
+            return
+        print(f"\nTask: {item['id']}")
+        print(f"Content: {item['content']}")
+        print(f"Status: {item['status']}")
+        print(f"Tier: {item.get('tier', 'medium')}")
+        print(f"Dependencies: {', '.join(item.get('dependencies', [])) or 'none'}")
+        print(f"Created: {item.get('created', 'unknown')}")
+        if item.get('completed'):
+            print(f"Completed: {item['completed']}")
+        if item.get('context'):
+            print(f"\nContext:\n{item['context']}")
+        if item.get('result'):
+            print(f"\nResult:\n{item['result']}")
+        if item.get('artifacts'):
+            print(f"\nArtifacts: {', '.join(item['artifacts'])}")
 
     elif action == "done":
         if not content:
@@ -357,9 +448,13 @@ def todo(
         count = todos.clear_completed()
         print(f"Cleared {count} completed todos")
 
+    elif action == "clearall":
+        count = todos.clear_all()
+        print(f"Cleared all {count} todos")
+
     else:
         print(f"Unknown action: {action}")
-        print("Actions: add, list, done, start, rm, clear")
+        print("Actions: add, list, show, done, start, rm, clear, clearall")
 
 
 @app.command()
@@ -401,6 +496,104 @@ def self_check():
         sys.exit(1)
     else:
         print(f"\nAll {len(files)} files OK")
+
+
+@app.command()
+def plan(task: str = typer.Argument(..., help="Task to break down into subtasks")):
+    """Plan a complex task using orchestrator (small model), then execute."""
+    config = load_config()
+    todos = TodoManager()
+    client = OllamaClient(
+        host=config["ollama"]["host"],
+        timeout=config["ollama"]["timeout"]
+    )
+
+    if not client.is_available():
+        print("Error: Ollama not available. Start it with: ollama serve")
+        return
+
+    # Clear any existing pending tasks
+    if todos.has_pending_tasks():
+        print("Warning: There are existing pending tasks.")
+        try:
+            choice = input("Clear them? [y/N]: ").strip().lower()
+            if choice in ("y", "yes"):
+                todos.clear_all()
+        except EOFError:
+            pass
+
+    # Use small model to plan
+    small_model = config["models"]["small"]
+    print(f"\n[orchestrator] Planning with {small_model}...")
+
+    tasks = plan_task(task, todos, client, small_model)
+
+    if not tasks:
+        print("[orchestrator] No tasks generated. Try rephrasing your request.")
+        return
+
+    display_plan(tasks, todos)
+
+    # User review
+    while True:
+        try:
+            choice = input("[e]dit  [a]pprove  [c]ancel: ").strip().lower()
+        except EOFError:
+            choice = "c"
+
+        if choice in ("a", "approve", ""):
+            break
+        elif choice in ("e", "edit"):
+            edit_plan(todos)
+            display_plan(todos.list(status="pending"), todos)
+        elif choice in ("c", "cancel"):
+            todos.clear_all()
+            print("[orchestrator] Cancelled.")
+            return
+        else:
+            print("Unknown choice")
+
+    # Auto-execute
+    print("\n[orchestrator] Starting execution...\n")
+    completed = work_all(todos, client, config["models"])
+    print(f"\n[orchestrator] Completed {completed} task(s).")
+
+
+@app.command()
+def work(
+    task_id: Optional[str] = typer.Argument(None, help="Specific task ID to execute"),
+    all_tasks: bool = typer.Option(False, "--all", "-a", help="Execute all ready tasks")
+):
+    """Execute pending tasks (workers use appropriate model per task tier)."""
+    config = load_config()
+    todos = TodoManager()
+    client = OllamaClient(
+        host=config["ollama"]["host"],
+        timeout=config["ollama"]["timeout"]
+    )
+
+    if not client.is_available():
+        print("Error: Ollama not available. Start it with: ollama serve")
+        return
+
+    if task_id:
+        # Execute specific task
+        task = todos.get(task_id)
+        if not task:
+            print(f"Task {task_id} not found")
+            return
+        execute_task(task_id, todos, client, config["models"])
+    elif all_tasks:
+        # Execute all ready tasks
+        completed = work_all(todos, client, config["models"])
+        print(f"\n[worker] Completed {completed} task(s).")
+    else:
+        # Execute next ready task
+        task = todos.get_next_task()
+        if not task:
+            print("No ready tasks. Use 'errol todo list' to see all tasks.")
+            return
+        execute_task(task["id"], todos, client, config["models"])
 
 
 if __name__ == "__main__":
