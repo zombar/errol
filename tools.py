@@ -140,7 +140,7 @@ TOOLS = {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Write content to a file",
+                "description": "Write content to a file. WARNING: This will overwrite existing files. Always read_file first to check if the file exists and see its contents before overwriting.",
                 "parameters": {
                     "type": "object",
                     "properties": {

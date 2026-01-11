@@ -59,7 +59,8 @@ You have access to these tools:
 - glob: Find files by pattern
 
 Guidelines:
-- Read files before editing them
+- ALWAYS read files before editing or overwriting them
+- Before using write_file, check if the file exists with glob or read_file first
 - Make minimal, focused changes
 - Test changes when possible (use bash to run tests/compilers)
 
