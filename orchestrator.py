@@ -16,14 +16,19 @@ Tier guidelines:
 
 The depends_on field should list indices (0-based) of tasks that must complete first.
 
+IMPORTANT: For documentation tasks, always plan to:
+1. First discover ALL source files in the repo (*.py, *.js, *.ts, *.go, etc.)
+2. Read the actual source code files to understand what they do
+3. Then generate documentation based on the code content
+
 After all tasks, output:
 {{"action": "done"}}
 
 Example for "document this repo":
-{{"action": "add_task", "content": "Find all Python files", "tier": "small", "depends_on": []}}
-{{"action": "add_task", "content": "Read and analyze errol.py", "tier": "medium", "depends_on": [0]}}
-{{"action": "add_task", "content": "Read and analyze tools.py", "tier": "medium", "depends_on": [0]}}
-{{"action": "add_task", "content": "Write comprehensive documentation to DOCS.md", "tier": "large", "depends_on": [1, 2]}}
+{{"action": "add_task", "content": "Find all source files (*.py, *.js, *.ts, etc.)", "tier": "small", "depends_on": []}}
+{{"action": "add_task", "content": "Read and analyze the main entry point and core modules", "tier": "medium", "depends_on": [0]}}
+{{"action": "add_task", "content": "Read and analyze utility/helper modules", "tier": "medium", "depends_on": [0]}}
+{{"action": "add_task", "content": "Write comprehensive documentation with actual content to DOCS.md", "tier": "large", "depends_on": [1, 2]}}
 {{"action": "done"}}
 
 Now break down this request:

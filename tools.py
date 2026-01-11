@@ -34,11 +34,15 @@ def show_diff(old: str, new: str, path: str) -> str:
 def read_file(path: str, offset: int = None, limit: int = None) -> str:
     """Read a file with optional line offset and limit."""
     try:
-        # Handle None values from JSON null
+        # Handle None values and string conversions from JSON
         if offset is None:
             offset = 0
+        else:
+            offset = int(offset)
         if limit is None:
             limit = 2000
+        else:
+            limit = int(limit)
 
         p = Path(path).expanduser().resolve()
         if not p.exists():
@@ -84,16 +88,24 @@ def edit_file(path: str, old_string: str, new_string: str) -> str:
     except Exception as e:
         return f"Error editing file: {e}"
 
-def run_bash(command: str, timeout: int = 120) -> str:
+def run_bash(command: str = None, timeout: int = 120, cwd: str = None, cmd: str = None) -> str:
     """Execute a bash command."""
     try:
+        # Handle 'cmd' as alias for 'command'
+        command = command or cmd
+        if not command:
+            return "Error: No command provided"
+        # Handle string timeout from JSON
+        if isinstance(timeout, str):
+            timeout = int(timeout)
+        work_dir = cwd if cwd else os.getcwd()
         result = subprocess.run(
             command,
             shell=True,
             capture_output=True,
             text=True,
             timeout=timeout,
-            cwd=os.getcwd()
+            cwd=work_dir
         )
         output = result.stdout + result.stderr
         if len(output) > 10000:

@@ -3,14 +3,48 @@ import json
 import time
 import sys
 import select
+import threading
 from pathlib import Path
 
 from llm import OllamaClient
 from todos import TodoManager
 from tools import execute_tool, get_tool_schemas, show_diff
 
+# ANSI colors
+DIM = "\033[2m"
+RESET = "\033[0m"
+
 # Read-only tools that auto-execute
 READONLY_TOOLS = ("read_file", "glob")
+
+
+class ThinkingTimer:
+    """Background timer that shows elapsed time during inference."""
+    def __init__(self):
+        self.running = False
+        self.thread = None
+        self.start_time = 0
+
+    def start(self):
+        self.running = True
+        self.start_time = time.time()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while self.running:
+            elapsed = time.time() - self.start_time
+            print(f"\r[thinking... {elapsed:.1f}s] ", end="", flush=True)
+            time.sleep(0.1)
+
+    def stop(self) -> float:
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=0.2)
+        elapsed = time.time() - self.start_time
+        # Clear the timer line
+        print("\r" + " " * 30 + "\r", end="", flush=True)
+        return elapsed
 
 WORKER_PROMPT = """You are executing a specific task. Focus only on this task.
 
@@ -209,10 +243,12 @@ def execute_task(task_id: str, todos: TodoManager, client: OllamaClient,
     tools = get_tool_schemas()
     full_output = []
 
+    timer = ThinkingTimer()
+
     for turn in range(max_turns):
-        start_time = time.time()
+        timer.start()
         response = client.chat_sync(model, messages, tools=tools)
-        elapsed = time.time() - start_time
+        elapsed = timer.stop()
 
         msg = response.get("message", {})
         content = msg.get("content", "")
@@ -222,7 +258,8 @@ def execute_task(task_id: str, todos: TodoManager, client: OllamaClient,
         if not tool_calls and content:
             tool_calls = parse_tool_calls_from_text(content)
 
-        print(f"[worker {elapsed:.1f}s] {content}")
+        # Dim LLM output to distinguish from tool output
+        print(f"[worker {elapsed:.1f}s] {DIM}{content}{RESET}")
         full_output.append(content)
 
         messages.append({"role": "assistant", "content": content, "tool_calls": tool_calls if tool_calls else None})

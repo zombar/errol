@@ -53,7 +53,12 @@ class OllamaClient:
             json=payload,
             timeout=self.timeout
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            try:
+                error_body = resp.json()
+            except:
+                error_body = resp.text
+            raise Exception(f"Ollama API error {resp.status_code}: {error_body}")
         return resp.json()
 
     def list_models(self) -> list[str]:

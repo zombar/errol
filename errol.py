@@ -26,22 +26,49 @@ from orchestrator import plan_task, display_plan, confirm_plan, edit_plan
 from worker import execute_task, work_all
 
 
+def extract_json_objects(text: str) -> list[str]:
+    """Extract JSON objects from text, handling nested braces."""
+    objects = []
+    i = 0
+    while i < len(text):
+        if text[i] == '{':
+            # Found start of object, count braces to find end
+            depth = 0
+            start = i
+            in_string = False
+            escape = False
+            while i < len(text):
+                ch = text[i]
+                if escape:
+                    escape = False
+                elif ch == '\\' and in_string:
+                    escape = True
+                elif ch == '"' and not escape:
+                    in_string = not in_string
+                elif not in_string:
+                    if ch == '{':
+                        depth += 1
+                    elif ch == '}':
+                        depth -= 1
+                        if depth == 0:
+                            objects.append(text[start:i+1])
+                            break
+                i += 1
+        i += 1
+    return objects
+
+
 def parse_tool_calls_from_text(text: str) -> list[dict]:
     """Extract first valid tool call from JSON in text (fallback for models without native tool support)."""
-    # Try to find JSON in code blocks first
-    code_block_pattern = r'```(?:json)?\s*(\{[\s\S]*?\})\s*```'
-    matches = re.findall(code_block_pattern, text)
+    # Extract all JSON objects from text
+    candidates = extract_json_objects(text)
 
-    # Also try to find bare JSON objects
-    if not matches:
-        bare_json_pattern = r'(\{\s*"name"\s*:[\s\S]*?"arguments"\s*:[\s\S]*?\})'
-        matches = re.findall(bare_json_pattern, text)
-
-    for match in matches:
+    for match in candidates:
         try:
             obj = json.loads(match)
-            if "name" in obj and "arguments" in obj:
-                args = obj["arguments"]
+            # Accept both "arguments" and "parameters" keys
+            args = obj.get("arguments") or obj.get("parameters")
+            if "name" in obj and args:
                 # Skip if arguments contain placeholders
                 args_str = json.dumps(args)
                 if '<' in args_str and '>' in args_str:
@@ -512,15 +539,9 @@ def plan(task: str = typer.Argument(..., help="Task to break down into subtasks"
         print("Error: Ollama not available. Start it with: ollama serve")
         return
 
-    # Clear any existing pending tasks
-    if todos.has_pending_tasks():
-        print("Warning: There are existing pending tasks.")
-        try:
-            choice = input("Clear them? [y/N]: ").strip().lower()
-            if choice in ("y", "yes"):
-                todos.clear_all()
-        except EOFError:
-            pass
+    # Always clear existing tasks before new plan
+    if todos.items:
+        todos.clear_all()
 
     # Use small model to plan
     small_model = config["models"]["small"]
