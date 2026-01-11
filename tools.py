@@ -107,6 +107,13 @@ def run_bash(command: str = None, timeout: int = 120, cwd: str = None, cmd: str 
         command = command or cmd
         if not command:
             return "Error: No command provided"
+        # Handle cmd passed as array (e.g. ["bash", "-c", "..."])
+        if isinstance(command, list):
+            # If it's ["bash", "-c", "actual command"] or ["bash", "-lc", "..."], extract the command
+            if len(command) >= 3 and command[0] == "bash" and command[1] in ("-c", "-lc"):
+                command = command[2]
+            else:
+                command = " ".join(str(c) for c in command)
         # Handle string timeout from JSON
         if isinstance(timeout, str):
             timeout = int(timeout)

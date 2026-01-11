@@ -128,6 +128,15 @@ def test_bash_string_timeout(r: TestResults):
         r.fail("bash_string_timeout", f"Expected 'test', got: {result}")
 
 
+def test_bash_cmd_array(r: TestResults):
+    """run_bash should handle cmd as array."""
+    result = run_bash(cmd=["bash", "-c", "echo array_test"])
+    if "array_test" in result:
+        r.ok("bash_cmd_array")
+    else:
+        r.fail("bash_cmd_array", f"Expected 'array_test', got: {result}")
+
+
 def test_execute_tool_filters_invalid_args(r: TestResults):
     """execute_tool should filter out invalid arguments."""
     # These extra args should be ignored, not cause a crash
@@ -254,6 +263,7 @@ def run_all_tests() -> TestResults:
     test_bash_missing_command(r)
     test_bash_cmd_alias(r)
     test_bash_string_timeout(r)
+    test_bash_cmd_array(r)
 
     # execute_tool tests
     test_execute_tool_filters_invalid_args(r)

@@ -192,17 +192,22 @@ SELF_PATH = Path(__file__).parent.resolve()
 
 SYSTEM_PROMPT = """You are Errol, a helpful coding and devops assistant.
 
+Current working directory: {cwd}
+Your source code is at: {self_path}
+
 You have access to these tools:
-- read_file: Read file contents
+- read_file: Read file contents (use absolute paths starting with /)
 - write_file: Write/create files
 - edit_file: Edit files (find/replace unique strings)
-- bash: Run shell commands
-- glob: Find files by pattern
+- bash: Run shell commands (pass command as a string, not an array)
+- glob: Find files by pattern (use "." for current directory)
 
 IMPORTANT - How to use tools:
 - Call ONE tool at a time and wait for the result before calling the next
-- Never use placeholders like <file-path> - use actual values from previous results
+- Use ABSOLUTE paths (starting with /) for all file operations
+- Never use placeholders like <file-path> - use actual values
 - After each tool call, you will receive the result, then decide what to do next
+- Stay focused on the user's original request
 
 Guidelines:
 - ALWAYS read files before editing or overwriting them
@@ -211,7 +216,6 @@ Guidelines:
 - Test changes when possible (use bash to run tests/compilers)
 
 Self-modification:
-- Your source code is at: {self_path}
 - You can modify your own code using edit_file
 - After self-edits, validate with: python -m py_compile <file>
 - Tell the user to restart after self-modifications
@@ -436,6 +440,7 @@ def agent_loop(task: str, config: dict, todos: TodoManager):
 
     # Build system prompt with self-awareness
     system = SYSTEM_PROMPT.format(
+        cwd=os.getcwd(),
         self_path=SELF_PATH,
         todos=todos.format_for_prompt()
     )
@@ -457,7 +462,23 @@ def agent_loop(task: str, config: dict, todos: TodoManager):
         tool_calls = []
 
         timer.start()
-        response = client.chat_sync(model, messages, tools=tools)
+        try:
+            response = client.chat_sync(model, messages, tools=tools)
+        except Exception as e:
+            # If Ollama fails to parse tool calls, retry without tools
+            error_str = str(e)
+            if "error parsing tool call" in error_str or "500" in error_str:
+                print(f"{YELLOW}⚠ Ollama tool parsing failed, retrying without tools...{RESET}")
+                try:
+                    response = client.chat_sync(model, messages, tools=None)
+                except Exception as e2:
+                    timer.stop()
+                    print(f"{RED}✗ API error: {e2}{RESET}")
+                    break
+            else:
+                timer.stop()
+                print(f"{RED}✗ API error: {e}{RESET}")
+                break
         timer.stop()
         elapsed = time.time() - timer.start_time
 
@@ -495,7 +516,8 @@ def agent_loop(task: str, config: dict, todos: TodoManager):
                 # Ask for confirmation
                 if confirm_tool(name, args):
                     result = execute_tool(name, args)
-                    if "Error" in result:
+                    # Only treat as error if starts with "Error" (not if content contains it)
+                    if result.startswith("Error"):
                         print(f"{RED}✗{RESET} {result[:500]}{'...' if len(result) > 500 else ''}")
                     else:
                         print(f"{GREEN}✓{RESET} {DIM}{result[:500]}{'...' if len(result) > 500 else ''}{RESET}")
