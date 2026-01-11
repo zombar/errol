@@ -17,29 +17,46 @@ ollama pull qwen2.5-coder:14b
 ollama serve
 ```
 
+## Installation
+
+To run `errol` from anywhere:
+
+```bash
+# Make the wrapper script executable
+chmod +x /path/to/errol/errol
+
+# Add to your shell profile (~/.zshrc or ~/.bashrc)
+export PATH="$PATH:/path/to/errol"
+
+# Reload your shell
+source ~/.zshrc  # or ~/.bashrc
+```
+
+Replace `/path/to/errol` with the actual path to the errol directory.
+
 ## Usage
 
 ```bash
 # Interactive chat
-python3 errol.py chat
+errol chat
 
 # Single task
-python3 errol.py chat "read errol.py and explain it"
-python3 errol.py chat "add a --verbose flag to the chat command"
+errol chat "read errol.py and explain it"
+errol chat "add a --verbose flag to the chat command"
 
 # Todos
-python3 errol.py todo add "implement caching"
-python3 errol.py todo list
-python3 errol.py todo start <id>
-python3 errol.py todo done <id>
-python3 errol.py todo rm <id>
-python3 errol.py todo clear
+errol todo add "implement caching"
+errol todo list
+errol todo start <id>
+errol todo done <id>
+errol todo rm <id>
+errol todo clear
 
 # Check available models
-python3 errol.py models
+errol models
 
 # Validate own source code
-python3 errol.py self-check
+errol self-check
 ```
 
 ## Model Routing
@@ -55,7 +72,7 @@ python3 errol.py self-check
 Errol knows its own source location and can modify itself:
 
 ```bash
-python3 errol.py chat "add a new tool called 'search_code' to tools.py"
+errol chat "add a new tool called 'search_code' to tools.py"
 ```
 
 All file changes show a git-style diff and require confirmation before applying.
@@ -75,5 +92,5 @@ models:
   large: qwen2.5-coder:14b
 
 agent:
-  max_turns: 20
+  max_turns: 75
 ```

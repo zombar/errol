@@ -31,9 +31,11 @@ def show_diff(old: str, new: str, path: str) -> str:
 
     return "\n".join(result)
 
-def read_file(path: str, offset: int = None, limit: int = None) -> str:
+def read_file(path: str = None, offset: int = None, limit: int = None) -> str:
     """Read a file with optional line offset and limit."""
     try:
+        if not path:
+            return "Error: 'path' parameter is required"
         # Handle None, "null" string, and type conversions from JSON
         if offset is None or offset == "null":
             offset = 0
@@ -126,9 +128,11 @@ def run_bash(command: str = None, timeout: int = 120, cwd: str = None, cmd: str 
     except Exception as e:
         return f"Error running command: {e}"
 
-def glob_files(pattern: str, path: str = ".") -> str:
+def glob_files(pattern: str = None, path: str = ".") -> str:
     """Find files matching a glob pattern."""
     try:
+        if not pattern:
+            return "Error: 'pattern' parameter is required"
         base = Path(path).expanduser().resolve()
         matches = list(base.glob(pattern))
         matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
@@ -239,9 +243,15 @@ TOOLS = {
 
 def execute_tool(name: str, args: dict) -> str:
     """Execute a tool by name with arguments."""
+    import inspect
     if name not in TOOLS:
         return f"Error: Unknown tool '{name}'"
-    return TOOLS[name]["fn"](**args)
+    fn = TOOLS[name]["fn"]
+    # Filter args to only include valid parameters for the function
+    sig = inspect.signature(fn)
+    valid_params = set(sig.parameters.keys())
+    filtered_args = {k: v for k, v in args.items() if k in valid_params}
+    return fn(**filtered_args)
 
 def get_tool_schemas() -> list[dict]:
     """Get all tool schemas for Ollama."""

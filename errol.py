@@ -17,6 +17,17 @@ import re
 import select
 from llm import OllamaClient
 
+# ANSI colors for styled output
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
+BLUE = "\033[94m"
+MAGENTA = "\033[95m"
+CYAN = "\033[96m"
+RED = "\033[91m"
+
 # Read-only tools that auto-execute after countdown
 READONLY_TOOLS = ("read_file", "glob")
 from router import Router
@@ -24,6 +35,35 @@ from tools import execute_tool, get_tool_schemas, TOOLS
 from todos import TodoManager
 from orchestrator import plan_task, display_plan, confirm_plan, edit_plan
 from worker import execute_task, work_all
+
+
+def looks_like_question(text: str) -> bool:
+    """Detect if the model is asking for user input instead of continuing."""
+    if not text:
+        return False
+    text_lower = text.lower()
+    # Phrases that indicate waiting for user input
+    waiting_phrases = [
+        "please respond",
+        "let me know",
+        "would you like",
+        "which file",
+        "which one",
+        "what would you",
+        "do you want",
+        "should i",
+        "please select",
+        "please choose",
+        "start with",
+    ]
+    for phrase in waiting_phrases:
+        if phrase in text_lower:
+            return True
+    # Check if ends with a question
+    stripped = text.strip()
+    if stripped.endswith("?"):
+        return True
+    return False
 
 
 def extract_json_objects(text: str) -> list[str]:
@@ -85,26 +125,60 @@ def parse_tool_calls_from_text(text: str) -> list[dict]:
 
     return []
 
-app = typer.Typer(help="Errol - MoE local LLM coding agent")
+app = typer.Typer(
+    name="errol",
+    help="Errol - MoE local LLM coding agent",
+    invoke_without_command=True,
+    no_args_is_help=False
+)
+
+@app.callback()
+def main(ctx: typer.Context):
+    """Errol - MoE local LLM coding agent. Run without arguments for interactive mode."""
+    if ctx.invoked_subcommand is None:
+        # No command given - start interactive chat
+        config = load_config()
+        todos = TodoManager()
+        print("Errol - MoE coding agent. Type 'quit' to exit.\n")
+        while True:
+            try:
+                task = input("you> ").strip()
+                if not task:
+                    continue
+                if task.lower() in ("quit", "exit", "q"):
+                    break
+                agent_loop(task, config, todos)
+            except KeyboardInterrupt:
+                print("\nBye!")
+                break
+            except EOFError:
+                break
+
 
 class Timer:
-    """Background timer that shows elapsed time during inference."""
+    """Background timer that shows elapsed time during inference with spinner."""
+    SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
     def __init__(self):
         self.running = False
         self.thread = None
         self.start_time = 0
+        self.frame = 0
 
     def start(self):
         self.running = True
         self.start_time = time.time()
+        self.frame = 0
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def _run(self):
         while self.running:
             elapsed = time.time() - self.start_time
-            print(f"\r[thinking... {elapsed:.1f}s] ", end="", flush=True)
-            time.sleep(0.1)
+            spin = self.SPINNER[self.frame % len(self.SPINNER)]
+            print(f"\r{DIM}{spin} thinking...{RESET} {DIM}({elapsed:.1f}s){RESET}  ", end="", flush=True)
+            self.frame += 1
+            time.sleep(0.08)
 
     def stop(self):
         self.running = False
@@ -165,10 +239,10 @@ def select_model(config: dict, router: Router, task: str, available: list) -> st
     suggested, category = router.classify(task)
     models = config["models"]
 
-    print(f"\nSelect model (suggested: {suggested} for '{category}'):")
-    print(f"  [1] {models['small']} (small - fast)")
-    print(f"  [2] {models['medium']} (medium)")
-    print(f"  [3] {models['large']} (large - powerful)")
+    print(f"\n{DIM}Select model {RESET}{DIM}(suggested: {suggested}){RESET}")
+    print(f"  {DIM}[1]{RESET} {models['small']}")
+    print(f"  {DIM}[2]{RESET} {models['medium']}")
+    print(f"  {DIM}[3]{RESET} {models['large']}")
 
     fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(fd)
@@ -176,7 +250,7 @@ def select_model(config: dict, router: Router, task: str, available: list) -> st
     try:
         tty.setcbreak(fd)
         for i in range(3, 0, -1):
-            print(f"\rChoice [1/2/3]: auto-select in {i}s ", end="", flush=True)
+            print(f"\r{DIM}[1/2/3] auto-select in {i}s{RESET} ", end="", flush=True)
             ready, _, _ = select.select([sys.stdin], [], [], 1.0)
             if ready:
                 ch = sys.stdin.read(1)
@@ -214,16 +288,20 @@ def preview_file_change(name: str, args: dict) -> str:
     """Generate a diff preview for file operations."""
     from tools import show_diff
     path = args.get("path", "")
+    if not path:
+        return ""
     p = Path(path).expanduser().resolve()
 
-    if name == "edit_file" and p.exists():
+    if name == "edit_file" and p.exists() and p.is_file():
         old_string = args.get("old_string", "")
         new_string = args.get("new_string", "")
+        if not old_string:
+            return ""
         content = p.read_text()
         if content.count(old_string) == 1:
             new_content = content.replace(old_string, new_string)
             return show_diff(content, new_content, p.name)
-    elif name == "write_file" and p.exists():
+    elif name == "write_file" and p.exists() and p.is_file():
         old_content = p.read_text()
         new_content = args.get("content", "")
         return show_diff(old_content, new_content, p.name)
@@ -241,7 +319,7 @@ def countdown_confirm(seconds: int = 3) -> bool:
     try:
         tty.setcbreak(fd)  # Don't wait for Enter
         for i in range(seconds, 0, -1):
-            print(f"\rAuto-execute in {i}s [n to cancel, Enter to run now] ", end="", flush=True)
+            print(f"\r{DIM}auto-run in {i}s{RESET} {DIM}[n=cancel, enter=run]{RESET} ", end="", flush=True)
             ready, _, _ = select.select([sys.stdin], [], [], 1.0)
             if ready:
                 ch = sys.stdin.read(1).lower()
@@ -255,39 +333,75 @@ def countdown_confirm(seconds: int = 3) -> bool:
 
 def confirm_tool(name: str, args: dict) -> bool:
     """Ask user to confirm tool execution, showing diff for file changes."""
-    print(f"\n{'='*60}")
-    print(f"Tool: {name}")
+    print(f"\n{DIM}{'─'*60}{RESET}")
+    print(f"{CYAN}◆{RESET} {BOLD}{name}{RESET}")
 
     # Show diff preview for file operations
     if name in ("edit_file", "write_file"):
         diff = preview_file_change(name, args)
         if diff:
-            print(f"{'='*60}")
+            print(f"{DIM}{'─'*60}{RESET}")
             print(diff)
         else:
             # Show args if no diff (new file or error)
             args_preview = json.dumps(args, indent=2)
             if len(args_preview) > 500:
                 args_preview = args_preview[:500] + "..."
-            print(f"Args: {args_preview}")
+            print(f"{DIM}{args_preview}{RESET}")
     else:
         args_preview = json.dumps(args, indent=2)
         if len(args_preview) > 300:
             args_preview = args_preview[:300] + "..."
-        print(f"Args: {args_preview}")
+        print(f"{DIM}{args_preview}{RESET}")
 
-    print(f"{'='*60}")
+    print(f"{DIM}{'─'*60}{RESET}")
 
     # Auto-confirm read-only tools with countdown
     if name in READONLY_TOOLS:
         return countdown_confirm()
 
     try:
-        confirm = input("Execute? [y/N]: ").strip().lower()
+        confirm = input(f"{YELLOW}Execute?{RESET} [y/N]: ").strip().lower()
     except EOFError:
         confirm = "n"
 
     return confirm in ("y", "yes")
+
+def show_todos_prompt(todos: TodoManager) -> bool:
+    """Show existing todos and let user continue or exit to edit. Returns True to continue."""
+    items = todos.list()
+    if not items:
+        return True
+
+    print(f"\n{DIM}{'─'*60}{RESET}")
+    print(f"{CYAN}◆{RESET} {BOLD}Current Todos{RESET}")
+    print(f"{DIM}{'─'*60}{RESET}")
+
+    for item in items:
+        status = item["status"]
+        marker = {"pending": "[ ]", "in_progress": "[>]", "complete": "[x]", "blocked": "[!]"}.get(status, "[ ]")
+        task_tier = item.get("tier", "medium")
+        tier_marker = {"small": "S", "medium": "M", "large": "L"}.get(task_tier, "M")
+        content = item['content']
+        if len(content) > 60:
+            content = content[:57] + "..."
+        print(f"  {DIM}{marker}{RESET} [{tier_marker}] {item['id']}: {content}")
+
+    print(f"{DIM}{'─'*60}{RESET}")
+    print(f"{DIM}Edit with: errol todo <add|done|rm|list> ...{RESET}")
+
+    try:
+        choice = input(f"{YELLOW}Continue?{RESET} [Y/n/e(xit)]: ").strip().lower()
+    except EOFError:
+        choice = "y"
+
+    if choice in ("e", "exit"):
+        print(f"{DIM}Exiting. Use 'errol todo' commands to edit, then re-run.{RESET}")
+        return False
+    elif choice == "n":
+        return False
+    return True
+
 
 def agent_loop(task: str, config: dict, todos: TodoManager):
     """Main agent execution loop."""
@@ -312,9 +426,13 @@ def agent_loop(task: str, config: dict, todos: TodoManager):
         print(f"Available: {', '.join(sorted(available))}")
         return
 
+    # Show todos and let user edit if needed
+    if not show_todos_prompt(todos):
+        return
+
     # Let user select model
     model = select_model(config, router, task, available)
-    print(f"\n[errol] Using {model}")
+    print(f"\n{MAGENTA}▶ errol{RESET} {DIM}using {model}{RESET}")
 
     # Build system prompt with self-awareness
     system = SYSTEM_PROMPT.format(
@@ -330,6 +448,8 @@ def agent_loop(task: str, config: dict, todos: TodoManager):
     tools = get_tool_schemas()
     max_turns = config["agent"]["max_turns"]
     timer = Timer()
+    reprompt_count = 0
+    max_reprompts = 5
 
     for turn in range(max_turns):
         # Get response (non-streaming for reliable tool calls)
@@ -349,7 +469,8 @@ def agent_loop(task: str, config: dict, todos: TodoManager):
         if not tool_calls and full_content:
             tool_calls = parse_tool_calls_from_text(full_content)
 
-        print(f"[errol {elapsed:.1f}s] {full_content}")
+        if full_content:
+            print(f"{MAGENTA}errol{RESET} {DIM}({elapsed:.1f}s){RESET} {full_content}")
 
         # Add assistant message to history
         assistant_msg = {"role": "assistant", "content": full_content}
@@ -374,10 +495,13 @@ def agent_loop(task: str, config: dict, todos: TodoManager):
                 # Ask for confirmation
                 if confirm_tool(name, args):
                     result = execute_tool(name, args)
-                    print(f"[result] {result[:500]}{'...' if len(result) > 500 else ''}")
+                    if "Error" in result:
+                        print(f"{RED}✗{RESET} {result[:500]}{'...' if len(result) > 500 else ''}")
+                    else:
+                        print(f"{GREEN}✓{RESET} {DIM}{result[:500]}{'...' if len(result) > 500 else ''}{RESET}")
                 else:
                     result = "Tool execution skipped by user"
-                    print(f"[skipped]")
+                    print(f"{YELLOW}○ skipped{RESET}")
 
                 # Add tool result to messages
                 messages.append({
@@ -385,11 +509,21 @@ def agent_loop(task: str, config: dict, todos: TodoManager):
                     "content": result
                 })
         else:
-            # No tool calls = done
-            break
+            # No tool calls - check if model is asking a question
+            if looks_like_question(full_content) and reprompt_count < max_reprompts:
+                reprompt_count += 1
+                print(f"{DIM}↻ continuing autonomously ({reprompt_count}/{max_reprompts})...{RESET}")
+                messages.append({
+                    "role": "user",
+                    "content": "Continue working on the task autonomously. Don't ask for input - make reasonable choices and proceed with the next step."
+                })
+                # Continue the loop instead of breaking
+            else:
+                # Truly done or max reprompts reached
+                break
 
     if turn >= max_turns - 1:
-        print(f"\n[errol] Reached max turns ({max_turns})")
+        print(f"\n{YELLOW}⚠ Reached max turns ({max_turns}){RESET}")
 
 
 @app.command()
@@ -533,10 +667,13 @@ def models():
 
 @app.command()
 def self_check():
-    """Validate Errol's own Python files."""
+    """Validate Errol's own Python files and run unit tests."""
     import py_compile
+
+    # Step 1: Syntax check
+    print("Checking Python syntax...")
     files = list(SELF_PATH.glob("*.py"))
-    errors = []
+    syntax_errors = []
 
     for f in files:
         try:
@@ -544,13 +681,27 @@ def self_check():
             print(f"  OK: {f.name}")
         except py_compile.PyCompileError as e:
             print(f"  ERROR: {f.name}: {e}")
-            errors.append(f)
+            syntax_errors.append(f)
 
-    if errors:
-        print(f"\n{len(errors)} file(s) have errors")
+    if syntax_errors:
+        print(f"\n{len(syntax_errors)} file(s) have syntax errors")
         sys.exit(1)
     else:
-        print(f"\nAll {len(files)} files OK")
+        print(f"All {len(files)} files OK")
+
+    # Step 2: Run unit tests
+    from test_tools import run_all_tests
+    results = run_all_tests()
+
+    print(f"\n{results.passed} tests passed, {results.failed} failed")
+
+    if results.failed > 0:
+        print("\nTest failures:")
+        for name, msg in results.errors:
+            print(f"  {name}: {msg}")
+        sys.exit(1)
+
+    print("\nAll checks passed!")
 
 
 @app.command()
@@ -646,4 +797,6 @@ def work(
 
 
 if __name__ == "__main__":
+    # Set program name for help output
+    sys.argv[0] = "errol"
     app()
