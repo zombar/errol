@@ -28,13 +28,14 @@ MAGENTA = "\033[95m"
 CYAN = "\033[96m"
 RED = "\033[91m"
 
+# Readline markers for non-printing characters (fixes cursor position with colors)
+RL_START = "\001"  # Start of non-printing sequence
+RL_END = "\002"    # End of non-printing sequence
+
 # Read-only tools that auto-execute after countdown
 READONLY_TOOLS = ("read_file", "glob")
 from router import Router
-from tools import execute_tool, get_tool_schemas, TOOLS
-from todos import TodoManager
-from orchestrator import plan_task, display_plan, confirm_plan, edit_plan
-from worker import execute_task, work_all
+from tools import execute_tool, get_tool_schemas, validate_tool_call, TOOLS
 
 
 def looks_like_question(text: str) -> bool:
@@ -67,12 +68,20 @@ def looks_like_question(text: str) -> bool:
         "which file should i",
         "which one should i",
         "what would you like",
+        "what you'd like",
+        "what do you want",
+        "what you want",
+        "let me know what",
+        "let me know which",
         "do you want me to",
         "should i start",
         "should i proceed",
         "please select",
         "please choose",
         "please specify",
+        "could you",
+        "can you clarify",
+        "can you specify",
     ]
     for phrase in action_phrases:
         if phrase in text_lower:
@@ -148,16 +157,28 @@ app = typer.Typer(
 )
 
 def interactive_input(prompt: str, prefill: str = "") -> str:
-    """Get input with readline support for history and editing."""
+    """Get input with readline support for history and multiline paste."""
     import readline
+    import sys
 
     # Set up prefill using readline startup hook
     if prefill:
         readline.set_startup_hook(lambda: readline.insert_text(prefill))
 
     try:
-        text = input(prompt)
-        return text.strip()
+        lines = [input(prompt)]
+
+        # Check for pasted multiline input - read any pending lines
+        while True:
+            ready, _, _ = select.select([sys.stdin], [], [], 0.01)
+            if not ready:
+                break
+            line = sys.stdin.readline()
+            if not line:
+                break
+            lines.append(line.rstrip('\n'))
+
+        return '\n'.join(lines).strip()
     except EOFError:
         return ""
     finally:
@@ -166,13 +187,12 @@ def interactive_input(prompt: str, prefill: str = "") -> str:
 
 @app.callback()
 def main(ctx: typer.Context):
-    """Errol - MoE local LLM coding agent. Run without arguments for interactive mode."""
+    """Errol - local LLM coding agent. Run without arguments for interactive mode."""
     if ctx.invoked_subcommand is None:
         # No command given - start interactive chat
         import readline
 
         config = load_config()
-        todos = TodoManager()
         last_task = ""
         prefill = ""
 
@@ -181,7 +201,7 @@ def main(ctx: typer.Context):
 
         while True:
             try:
-                task = interactive_input(f"{CYAN}▷{RESET} ", prefill)
+                task = interactive_input(f"{RL_START}{CYAN}{RL_END}▷{RL_START}{RESET}{RL_END} ", prefill)
                 prefill = ""  # Clear prefill after input
 
                 if not task:
@@ -194,7 +214,7 @@ def main(ctx: typer.Context):
                 readline.add_history(task)
                 last_task = task
 
-                cancelled = agent_loop(task, config, todos)
+                cancelled = agent_loop(task, config)
                 if cancelled:
                     prefill = last_task  # Prefill for easy retry
                 print()  # Blank line between interactions
@@ -246,31 +266,30 @@ SELF_PATH = Path(__file__).parent.resolve()
 SYSTEM_PROMPT = """You are Errol, a helpful coding and devops assistant.
 
 Current working directory: {cwd}
-IMPORTANT: Only work with files in the current directory. Do not access files outside of {cwd} unless explicitly asked.
 
-You have access to these tools:
-- read_file: Read file contents (use absolute paths starting with /)
-- write_file: Write/create files
-- edit_file: Edit files (find/replace unique strings - MUST match exact whitespace/indentation)
-- bash: Run shell commands (pass command as a string, not an array)
-- glob: Find files by pattern (use "." for current directory)
+## Available Tools (ONLY these exist - no others):
+- read_file(path, offset, limit): Read file contents
+- write_file(path, content): Create or overwrite files
+- edit_file(path, old_string, new_string, replace_all=false): Find/replace string in file
+- bash(command, timeout): Run shell commands
+- glob(pattern, path): Find files by pattern
 
-IMPORTANT - How to use tools:
-- Call ONE tool at a time and wait for the result before calling the next
-- Use ABSOLUTE paths (starting with /) for all file operations
-- Never use placeholders like <file-path> - use actual values
-- After each tool call, you will receive the result, then decide what to do next
-- Stay focused on the user's original request
-- Only search/read files in the current working directory
+IMPORTANT: These are the ONLY tools. Do not try "search", "grep", "container.exec", "repo_browser", or any other tool names.
 
-Guidelines:
-- ALWAYS read files before editing or overwriting them
-- Before using write_file, check if the file exists with glob or read_file first
-- Make minimal, focused changes
-- Test changes when possible (use bash to run tests/compilers)
-- Create new files in the current directory when needed
+## CRITICAL: Stay On Task
+- Your ONLY job is to answer/complete what the user asked
+- Do NOT provide unsolicited code reviews, analysis, or suggestions
+- Do NOT explain what the code does unless asked
+- After reading files, IMMEDIATELY address the user's original request
+- If the user asks to add/modify something, DO that - don't analyze instead
+- When the task is clear, proceed without asking "what do you want me to do"
 
-{todos}
+## Rules:
+- Call ONE tool at a time, wait for result
+
+## Completion Requirement:
+After gathering information, you MUST directly address the user's original request.
+Do not summarize what you read - do what the user asked.
 """
 
 def load_config() -> dict:
@@ -440,43 +459,7 @@ def confirm_tool(name: str, args: dict) -> bool:
 
     return confirm in ("y", "yes")
 
-def show_todos_prompt(todos: TodoManager) -> bool:
-    """Show existing todos and let user continue or exit to edit. Returns True to continue."""
-    items = todos.list()
-    if not items:
-        return True
-
-    print(f"\n{DIM}{'─'*60}{RESET}")
-    print(f"{CYAN}◆{RESET} {BOLD}Current Todos{RESET}")
-    print(f"{DIM}{'─'*60}{RESET}")
-
-    for item in items:
-        status = item["status"]
-        marker = {"pending": "[ ]", "in_progress": "[>]", "complete": "[x]", "blocked": "[!]"}.get(status, "[ ]")
-        task_tier = item.get("tier", "medium")
-        tier_marker = {"small": "S", "medium": "M", "large": "L"}.get(task_tier, "M")
-        content = item['content']
-        if len(content) > 60:
-            content = content[:57] + "..."
-        print(f"  {DIM}{marker}{RESET} [{tier_marker}] {item['id']}: {content}")
-
-    print(f"{DIM}{'─'*60}{RESET}")
-    print(f"{DIM}Edit with: errol todo <add|done|rm|list> ...{RESET}")
-
-    try:
-        choice = input(f"{YELLOW}Continue?{RESET} [Y/n/e(xit)]: ").strip().lower()
-    except EOFError:
-        choice = "y"
-
-    if choice in ("e", "exit"):
-        print(f"{DIM}Exiting. Use 'errol todo' commands to edit, then re-run.{RESET}")
-        return False
-    elif choice == "n":
-        return False
-    return True
-
-
-def agent_loop(task: str, config: dict, todos: TodoManager) -> bool:
+def agent_loop(task: str, config: dict) -> bool:
     """Main agent execution loop. Returns True if cancelled by ESC."""
     client = OllamaClient(
         host=config["ollama"]["host"],
@@ -499,10 +482,6 @@ def agent_loop(task: str, config: dict, todos: TodoManager) -> bool:
         print(f"Available: {', '.join(sorted(available))}")
         return False
 
-    # Show todos and let user edit if needed
-    if not show_todos_prompt(todos):
-        return False
-
     # Select model (skip picker if disabled in config)
     if config["agent"].get("show_model_picker", True):
         model = select_model(config, router, task, available)
@@ -512,10 +491,7 @@ def agent_loop(task: str, config: dict, todos: TodoManager) -> bool:
     print(f"\n{MAGENTA}▶ errol{RESET} {DIM}using {model}{RESET}")
 
     # Build system prompt
-    system = SYSTEM_PROMPT.format(
-        cwd=os.getcwd(),
-        todos=todos.format_for_prompt()
-    )
+    system = SYSTEM_PROMPT.format(cwd=os.getcwd())
 
     messages = [
         {"role": "system", "content": system},
@@ -606,8 +582,15 @@ def agent_loop(task: str, config: dict, todos: TodoManager) -> bool:
                     except:
                         args = {}
 
-                # Ask for confirmation
-                if confirm_tool(name, args):
+                # Validate before prompting
+                validation_error = validate_tool_call(name, args)
+                if validation_error:
+                    print(f"\n{DIM}{'─'*60}{RESET}")
+                    print(f"{CYAN}◆{RESET} {name}")
+                    print(f"{DIM}{'─'*60}{RESET}")
+                    print(f"{RED}✗ Error: {validation_error}{RESET}")
+                    result = f"Error: {validation_error}"
+                elif confirm_tool(name, args):
                     result = execute_tool(name, args)
                     # Only treat as error if starts with "Error" (not if content contains it)
                     if result.startswith("Error"):
@@ -647,13 +630,12 @@ def agent_loop(task: str, config: dict, todos: TodoManager) -> bool:
 def chat(task: Optional[str] = typer.Argument(None, help="Task to perform")):
     """Chat with Errol. Interactive mode if no task given."""
     config = load_config()
-    todos = TodoManager()
 
     if task:
-        agent_loop(task, config, todos)
+        agent_loop(task, config)
     else:
         # Interactive mode
-        print("Errol - MoE coding agent. Type 'quit' to exit.\n")
+        print("Errol - coding agent. Type 'quit' to exit.\n")
         while True:
             try:
                 task = input("you> ").strip()
@@ -661,106 +643,12 @@ def chat(task: Optional[str] = typer.Argument(None, help="Task to perform")):
                     continue
                 if task.lower() in ("quit", "exit", "q"):
                     break
-                agent_loop(task, config, todos)
+                agent_loop(task, config)
             except KeyboardInterrupt:
                 print("\nBye!")
                 break
             except EOFError:
                 break
-
-
-@app.command()
-def todo(
-    action: str = typer.Argument(..., help="add|list|show|done|start|rm|clear|clearall"),
-    content: Optional[str] = typer.Argument(None, help="Todo content or ID"),
-    tier: Optional[str] = typer.Option(None, "--tier", "-t", help="Task tier: small|medium|large")
-):
-    """Manage todos: add, list, show, done, start, rm, clear, clearall"""
-    todos = TodoManager()
-
-    if action == "add":
-        if not content:
-            print("Usage: errol todo add 'task description' [--tier small|medium|large]")
-            return
-        task_tier = tier or "medium"
-        id = todos.add(content, tier=task_tier)
-        print(f"Added todo {id} ({task_tier}): {content}")
-
-    elif action == "list":
-        items = todos.list(status=content)  # content can be status filter
-        if not items:
-            print("No todos.")
-        else:
-            for item in items:
-                status = item["status"]
-                marker = {"pending": "[ ]", "in_progress": "[>]", "complete": "[x]", "blocked": "[!]"}.get(status, "[ ]")
-                task_tier = item.get("tier", "medium")
-                tier_marker = {"small": "S", "medium": "M", "large": "L"}.get(task_tier, "M")
-                deps = item.get("dependencies", [])
-                dep_str = f" [deps: {','.join(deps)}]" if deps else ""
-                print(f"{marker} [{tier_marker}] {item['id']}: {item['content']}{dep_str}")
-
-    elif action == "show":
-        if not content:
-            print("Usage: errol todo show <id>")
-            return
-        item = todos.get(content)
-        if not item:
-            print(f"Todo {content} not found")
-            return
-        print(f"\nTask: {item['id']}")
-        print(f"Content: {item['content']}")
-        print(f"Status: {item['status']}")
-        print(f"Tier: {item.get('tier', 'medium')}")
-        print(f"Dependencies: {', '.join(item.get('dependencies', [])) or 'none'}")
-        print(f"Created: {item.get('created', 'unknown')}")
-        if item.get('completed'):
-            print(f"Completed: {item['completed']}")
-        if item.get('context'):
-            print(f"\nContext:\n{item['context']}")
-        if item.get('result'):
-            print(f"\nResult:\n{item['result']}")
-        if item.get('artifacts'):
-            print(f"\nArtifacts: {', '.join(item['artifacts'])}")
-
-    elif action == "done":
-        if not content:
-            print("Usage: errol todo done <id>")
-            return
-        if todos.complete(content):
-            print(f"Completed {content}")
-        else:
-            print(f"Todo {content} not found")
-
-    elif action == "start":
-        if not content:
-            print("Usage: errol todo start <id>")
-            return
-        if todos.start(content):
-            print(f"Started {content}")
-        else:
-            print(f"Todo {content} not found")
-
-    elif action == "rm":
-        if not content:
-            print("Usage: errol todo rm <id>")
-            return
-        if todos.remove(content):
-            print(f"Removed {content}")
-        else:
-            print(f"Todo {content} not found")
-
-    elif action == "clear":
-        count = todos.clear_completed()
-        print(f"Cleared {count} completed todos")
-
-    elif action == "clearall":
-        count = todos.clear_all()
-        print(f"Cleared all {count} todos")
-
-    else:
-        print(f"Unknown action: {action}")
-        print("Actions: add, list, show, done, start, rm, clear, clearall")
 
 
 @app.command()
@@ -819,103 +707,6 @@ def self_check():
         sys.exit(1)
 
     print("\nAll checks passed!")
-
-
-@app.command()
-def plan(task: str = typer.Argument(..., help="Task to break down into subtasks")):
-    """Plan a complex task using orchestrator (small model), then execute."""
-    config = load_config()
-    todos = TodoManager()
-    client = OllamaClient(
-        host=config["ollama"]["host"],
-        timeout=config["ollama"]["timeout"]
-    )
-
-    if not client.is_available():
-        print("Error: Ollama not available. Start it with: ollama serve")
-        return
-
-    # Always clear existing tasks before new plan
-    if todos.items:
-        todos.clear_all()
-
-    # Use small model to plan
-    small_model = config["models"]["small"]
-    print(f"\n{MAGENTA}▶ errol{RESET} {DIM}plan mode{RESET}")
-    print(f"{DIM}Planning with {small_model}...{RESET}")
-
-    tasks = plan_task(task, todos, client, small_model)
-
-    if not tasks:
-        print(f"{DIM}No tasks generated. Try rephrasing your request.{RESET}")
-        return
-
-    display_plan(tasks, todos)
-
-    # User review
-    print(f"{DIM}[e]dit  [a]pprove  [c]ancel  (Ctrl+C to exit){RESET}")
-    while True:
-        try:
-            choice = interactive_input(f"{CYAN}▷{RESET} ", "").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            todos.clear_all()
-            print(f"{DIM}Cancelled.{RESET}")
-            return
-
-        if choice in ("a", "approve", ""):
-            break
-        elif choice in ("e", "edit"):
-            edit_plan(todos)
-            display_plan(todos.list(status="pending"), todos)
-        elif choice in ("c", "cancel"):
-            todos.clear_all()
-            print(f"{DIM}Cancelled.{RESET}")
-            return
-        else:
-            print(f"{DIM}Unknown choice{RESET}")
-
-    # Auto-execute
-    print(f"\n{DIM}Starting execution...{RESET}\n")
-    completed = work_all(todos, client, config["models"])
-    print(f"\n{DIM}Completed {completed} task(s).{RESET}")
-
-
-@app.command()
-def work(
-    task_id: Optional[str] = typer.Argument(None, help="Specific task ID to execute"),
-    all_tasks: bool = typer.Option(False, "--all", "-a", help="Execute all ready tasks")
-):
-    """Execute pending tasks (workers use appropriate model per task tier)."""
-    config = load_config()
-    todos = TodoManager()
-    client = OllamaClient(
-        host=config["ollama"]["host"],
-        timeout=config["ollama"]["timeout"]
-    )
-
-    if not client.is_available():
-        print("Error: Ollama not available. Start it with: ollama serve")
-        return
-
-    if task_id:
-        # Execute specific task
-        task = todos.get(task_id)
-        if not task:
-            print(f"Task {task_id} not found")
-            return
-        execute_task(task_id, todos, client, config["models"])
-    elif all_tasks:
-        # Execute all ready tasks
-        completed = work_all(todos, client, config["models"])
-        print(f"\n[worker] Completed {completed} task(s).")
-    else:
-        # Execute next ready task
-        task = todos.get_next_task()
-        if not task:
-            print("No ready tasks. Use 'errol todo list' to see all tasks.")
-            return
-        execute_task(task["id"], todos, client, config["models"])
 
 
 if __name__ == "__main__":

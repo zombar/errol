@@ -4,6 +4,7 @@ import glob as globlib
 import subprocess
 import difflib
 from pathlib import Path
+from typing import Optional
 
 # ANSI colors for diff output
 RED = "\033[91m"
@@ -76,7 +77,7 @@ def write_file(path: str = None, content: str = None) -> str:
     except Exception as e:
         return f"Error writing file: {e}"
 
-def edit_file(path: str = None, old_string: str = None, new_string: str = None) -> str:
+def edit_file(path: str = None, old_string: str = None, new_string: str = None, replace_all: bool = False) -> str:
     """Replace old_string with new_string in file."""
     try:
         if not path:
@@ -97,12 +98,13 @@ def edit_file(path: str = None, old_string: str = None, new_string: str = None) 
 
         if count == 0:
             return f"Error: String not found in file"
-        if count > 1:
-            return f"Error: String found {count} times, must be unique"
+        if count > 1 and not replace_all:
+            return f"Error: String found {count} times, must be unique. Use replace_all=true to replace all occurrences."
 
         new_content = content.replace(old_string, new_string)
         p.write_text(new_content)
-        return f"Edited {path}: applied changes"
+        replaced_msg = f" ({count} occurrences)" if count > 1 else ""
+        return f"Edited {path}: applied changes{replaced_msg}"
     except Exception as e:
         return f"Error editing file: {e}"
 
@@ -141,6 +143,10 @@ def run_bash(command: str = None, timeout: int = 120, cwd: str = None, cmd: str 
     except Exception as e:
         return f"Error running command: {e}"
 
+# Directories to always exclude from glob results
+GLOB_EXCLUDES = {'venv', 'node_modules', '__pycache__', '.git', '.venv', 'env', '.env',
+                 'dist', 'build', '.tox', '.pytest_cache', '.mypy_cache', 'eggs', '*.egg-info'}
+
 def glob_files(pattern: str = None, path: str = ".") -> str:
     """Find files matching a glob pattern."""
     try:
@@ -151,6 +157,13 @@ def glob_files(pattern: str = None, path: str = ".") -> str:
         pattern = pattern.strip() if pattern else pattern
         base = Path(path).expanduser().resolve()
         matches = list(base.glob(pattern))
+
+        # Filter out excluded directories
+        def should_include(p: Path) -> bool:
+            parts = p.relative_to(base).parts
+            return not any(part in GLOB_EXCLUDES for part in parts)
+
+        matches = [m for m in matches if should_include(m)]
         matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
         if not matches:
@@ -206,13 +219,14 @@ TOOLS = {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Replace a unique string in a file with new content",
+                "description": "Replace a string in a file with new content. String must be unique unless replace_all=true.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path"},
-                        "old_string": {"type": "string", "description": "String to find (must be unique)"},
-                        "new_string": {"type": "string", "description": "Replacement string"}
+                        "old_string": {"type": "string", "description": "String to find"},
+                        "new_string": {"type": "string", "description": "Replacement string"},
+                        "replace_all": {"type": "boolean", "description": "Replace all occurrences (default false, requires unique match)"}
                     },
                     "required": ["path", "old_string", "new_string"]
                 }
@@ -257,11 +271,72 @@ TOOLS = {
     }
 }
 
+def validate_tool_call(name: str, args: dict) -> Optional[str]:
+    """Pre-validate a tool call. Returns error string if invalid, None if OK."""
+    import re
+
+    # Check tool exists
+    if name not in TOOLS:
+        available = ", ".join(TOOLS.keys())
+        return f"Unknown tool '{name}'. Available tools: {available}"
+
+    # Check for placeholders
+    for key, val in args.items():
+        if isinstance(val, str) and re.search(r'<[a-zA-Z_-]+>', val):
+            return f"Placeholder detected in '{key}': {val}. Use actual values."
+
+    # Validate edit_file: check string exists and is unique (unless replace_all)
+    if name == "edit_file":
+        path = args.get("path", "")
+        old_string = args.get("old_string", "")
+        replace_all = args.get("replace_all", False)
+        if path and old_string:
+            p = Path(path).expanduser().resolve()
+            if not p.exists():
+                return f"File not found: {path}"
+            try:
+                content = p.read_text()
+                count = content.count(old_string)
+                if count == 0:
+                    return "String not found in file"
+                if count > 1 and not replace_all:
+                    return f"String found {count} times, must be unique. Use replace_all=true to replace all."
+            except Exception as e:
+                return f"Cannot read file: {e}"
+
+    # Validate read_file: check file exists
+    if name == "read_file":
+        path = args.get("path", "")
+        if path:
+            p = Path(path).expanduser().resolve()
+            if not p.exists():
+                return f"File not found: {path}"
+            if not p.is_file():
+                return f"Not a file: {path}"
+
+    return None  # Valid
+
+
 def execute_tool(name: str, args: dict) -> str:
     """Execute a tool by name with arguments."""
     import inspect
+    import re
+
     if name not in TOOLS:
-        return f"Error: Unknown tool '{name}'"
+        available = ", ".join(TOOLS.keys())
+        return f"Error: Unknown tool '{name}'. Available tools: {available}"
+
+    # Reject placeholder values like <filename>, <path>, etc.
+    for key, val in args.items():
+        if isinstance(val, str) and re.search(r'<[a-zA-Z_-]+>', val):
+            return f"Error: Placeholder detected in '{key}': {val}. Use actual values, not placeholders."
+
+    # Auto-convert relative paths to absolute for path arguments
+    if 'path' in args and args['path']:
+        p = args['path'].strip()
+        if not p.startswith('/') and not p.startswith('~'):
+            args['path'] = str(Path.cwd() / p)
+
     fn = TOOLS[name]["fn"]
     # Filter args to only include valid parameters for the function
     sig = inspect.signature(fn)

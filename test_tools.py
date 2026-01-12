@@ -203,7 +203,9 @@ def test_parse_tool_calls_arguments_key(r: TestResults):
 
 def test_glob_files_basic(r: TestResults):
     """glob_files should find Python files."""
-    result = glob_files("*.py")
+    # Use absolute path to this test file's directory
+    test_dir = Path(__file__).parent.resolve()
+    result = glob_files("*.py", str(test_dir))
     if "errol.py" in result or "tools.py" in result:
         r.ok("glob_files_basic")
     else:
