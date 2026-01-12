@@ -41,28 +41,43 @@ def looks_like_question(text: str) -> bool:
     """Detect if the model is asking for user input instead of continuing."""
     if not text:
         return False
+
     text_lower = text.lower()
-    # Phrases that indicate waiting for user input
-    waiting_phrases = [
-        "please respond",
-        "let me know",
-        "would you like",
-        "which file",
-        "which one",
-        "what would you",
-        "do you want",
-        "should i",
+
+    # Phrases that indicate task completion (not waiting for input)
+    completion_phrases = [
+        "here are",
+        "here is",
+        "i have",
+        "done",
+        "complete",
+        "finished",
+        "created",
+        "written",
+        "edited",
+        "the files",
+        "the result",
+    ]
+    for phrase in completion_phrases:
+        if phrase in text_lower:
+            return False
+
+    # Only trigger on direct questions requiring action
+    action_phrases = [
+        "which file should i",
+        "which one should i",
+        "what would you like",
+        "do you want me to",
+        "should i start",
+        "should i proceed",
         "please select",
         "please choose",
-        "start with",
+        "please specify",
     ]
-    for phrase in waiting_phrases:
+    for phrase in action_phrases:
         if phrase in text_lower:
             return True
-    # Check if ends with a question
-    stripped = text.strip()
-    if stripped.endswith("?"):
-        return True
+
     return False
 
 
@@ -132,26 +147,64 @@ app = typer.Typer(
     no_args_is_help=False
 )
 
+def interactive_input(prompt: str, prefill: str = "") -> str:
+    """Get input with readline support for history and editing."""
+    import readline
+
+    # Set up prefill using readline startup hook
+    if prefill:
+        readline.set_startup_hook(lambda: readline.insert_text(prefill))
+
+    try:
+        text = input(prompt)
+        return text.strip()
+    except EOFError:
+        return ""
+    finally:
+        readline.set_startup_hook()
+
+
 @app.callback()
 def main(ctx: typer.Context):
     """Errol - MoE local LLM coding agent. Run without arguments for interactive mode."""
     if ctx.invoked_subcommand is None:
         # No command given - start interactive chat
+        import readline
+
         config = load_config()
         todos = TodoManager()
-        print("Errol - MoE coding agent. Type 'quit' to exit.\n")
+        last_task = ""
+        prefill = ""
+
+        print(f"\n{MAGENTA}▶ errol{RESET} {DIM}interactive mode{RESET}")
+        print(f"{DIM}↑/↓ history, ←/→ cursor, 'quit' to exit{RESET}\n")
+
         while True:
             try:
-                task = input("you> ").strip()
+                task = interactive_input(f"{CYAN}▷{RESET} ", prefill)
+                prefill = ""  # Clear prefill after input
+
                 if not task:
                     continue
                 if task.lower() in ("quit", "exit", "q"):
+                    print(f"{DIM}Bye!{RESET}")
                     break
-                agent_loop(task, config, todos)
+
+                # Add to readline history
+                readline.add_history(task)
+                last_task = task
+
+                cancelled = agent_loop(task, config, todos)
+                if cancelled:
+                    prefill = last_task  # Prefill for easy retry
+                print()  # Blank line between interactions
+
             except KeyboardInterrupt:
-                print("\nBye!")
-                break
+                # Ctrl+C at prompt - just show new prompt
+                print()
+                continue
             except EOFError:
+                print(f"{DIM}Bye!{RESET}")
                 break
 
 
@@ -185,7 +238,7 @@ class Timer:
         if self.thread:
             self.thread.join(timeout=0.2)
         # Clear the timer line
-        print("\r" + " " * 30 + "\r", end="", flush=True)
+        print("\r" + " " * 40 + "\r", end="", flush=True)
 
 # Self-awareness: know where our code lives
 SELF_PATH = Path(__file__).parent.resolve()
@@ -193,12 +246,12 @@ SELF_PATH = Path(__file__).parent.resolve()
 SYSTEM_PROMPT = """You are Errol, a helpful coding and devops assistant.
 
 Current working directory: {cwd}
-Your source code is at: {self_path}
+IMPORTANT: Only work with files in the current directory. Do not access files outside of {cwd} unless explicitly asked.
 
 You have access to these tools:
 - read_file: Read file contents (use absolute paths starting with /)
 - write_file: Write/create files
-- edit_file: Edit files (find/replace unique strings)
+- edit_file: Edit files (find/replace unique strings - MUST match exact whitespace/indentation)
 - bash: Run shell commands (pass command as a string, not an array)
 - glob: Find files by pattern (use "." for current directory)
 
@@ -208,17 +261,14 @@ IMPORTANT - How to use tools:
 - Never use placeholders like <file-path> - use actual values
 - After each tool call, you will receive the result, then decide what to do next
 - Stay focused on the user's original request
+- Only search/read files in the current working directory
 
 Guidelines:
 - ALWAYS read files before editing or overwriting them
 - Before using write_file, check if the file exists with glob or read_file first
 - Make minimal, focused changes
 - Test changes when possible (use bash to run tests/compilers)
-
-Self-modification:
-- You can modify your own code using edit_file
-- After self-edits, validate with: python -m py_compile <file>
-- Tell the user to restart after self-modifications
+- Create new files in the current directory when needed
 
 {todos}
 """
@@ -291,6 +341,7 @@ def select_model(config: dict, router: Router, task: str, available: list) -> st
 def preview_file_change(name: str, args: dict) -> str:
     """Generate a diff preview for file operations."""
     from tools import show_diff
+    import difflib
     path = args.get("path", "")
     if not path:
         return ""
@@ -302,13 +353,31 @@ def preview_file_change(name: str, args: dict) -> str:
         if not old_string:
             return ""
         content = p.read_text()
-        if content.count(old_string) == 1:
+        count = content.count(old_string)
+        if count == 1:
             new_content = content.replace(old_string, new_string)
             return show_diff(content, new_content, p.name)
-    elif name == "write_file" and p.exists() and p.is_file():
-        old_content = p.read_text()
+        elif count == 0:
+            # String not found - try to find close matches
+            lines = content.splitlines()
+            old_lines = old_string.splitlines()
+            if old_lines:
+                # Find best matching line
+                matches = difflib.get_close_matches(old_lines[0].strip(), [l.strip() for l in lines], n=1, cutoff=0.6)
+                if matches:
+                    return f"{RED}String not found.{RESET} Similar line exists:\n{DIM}{matches[0]}{RESET}\n{YELLOW}Check indentation/whitespace.{RESET}"
+            return f"{RED}String not found in file.{RESET} {YELLOW}Check indentation/whitespace.{RESET}"
+        else:
+            return f"{YELLOW}String found {count} times (must be unique).{RESET}"
+    elif name == "write_file":
         new_content = args.get("content", "")
-        return show_diff(old_content, new_content, p.name)
+        if p.exists() and p.is_file():
+            # Overwriting existing file
+            old_content = p.read_text()
+            return show_diff(old_content, new_content, p.name)
+        else:
+            # New file - show as all additions
+            return show_diff("", new_content, p.name)
 
     return ""
 
@@ -407,8 +476,8 @@ def show_todos_prompt(todos: TodoManager) -> bool:
     return True
 
 
-def agent_loop(task: str, config: dict, todos: TodoManager):
-    """Main agent execution loop."""
+def agent_loop(task: str, config: dict, todos: TodoManager) -> bool:
+    """Main agent execution loop. Returns True if cancelled by ESC."""
     client = OllamaClient(
         host=config["ollama"]["host"],
         timeout=config["ollama"]["timeout"]
@@ -418,7 +487,7 @@ def agent_loop(task: str, config: dict, todos: TodoManager):
     # Check Ollama is running
     if not client.is_available():
         print("Error: Ollama not available. Start it with: ollama serve")
-        return
+        return False
 
     # Check configured models are available
     available = client.list_models()
@@ -428,20 +497,23 @@ def agent_loop(task: str, config: dict, todos: TodoManager):
         print(f"Warning: Missing models: {', '.join(missing)}")
         print(f"Pull with: ollama pull <model>")
         print(f"Available: {', '.join(sorted(available))}")
-        return
+        return False
 
     # Show todos and let user edit if needed
     if not show_todos_prompt(todos):
-        return
+        return False
 
-    # Let user select model
-    model = select_model(config, router, task, available)
+    # Select model (skip picker if disabled in config)
+    if config["agent"].get("show_model_picker", True):
+        model = select_model(config, router, task, available)
+    else:
+        # Use router's suggestion directly
+        model, _ = router.classify(task)
     print(f"\n{MAGENTA}▶ errol{RESET} {DIM}using {model}{RESET}")
 
-    # Build system prompt with self-awareness
+    # Build system prompt
     system = SYSTEM_PROMPT.format(
         cwd=os.getcwd(),
-        self_path=SELF_PATH,
         todos=todos.format_for_prompt()
     )
 
@@ -464,6 +536,10 @@ def agent_loop(task: str, config: dict, todos: TodoManager):
         timer.start()
         try:
             response = client.chat_sync(model, messages, tools=tools)
+        except KeyboardInterrupt:
+            timer.stop()
+            print(f"\n{YELLOW}⚠ Interrupted{RESET}")
+            return True  # Signal cancellation
         except Exception as e:
             # If Ollama fails to parse tool calls, retry without tools
             error_str = str(e)
@@ -471,6 +547,10 @@ def agent_loop(task: str, config: dict, todos: TodoManager):
                 print(f"{YELLOW}⚠ Ollama tool parsing failed, retrying without tools...{RESET}")
                 try:
                     response = client.chat_sync(model, messages, tools=None)
+                except KeyboardInterrupt:
+                    timer.stop()
+                    print(f"\n{YELLOW}⚠ Interrupted{RESET}")
+                    return True
                 except Exception as e2:
                     timer.stop()
                     print(f"{RED}✗ API error: {e2}{RESET}")
@@ -491,7 +571,20 @@ def agent_loop(task: str, config: dict, todos: TodoManager):
             tool_calls = parse_tool_calls_from_text(full_content)
 
         if full_content:
-            print(f"{MAGENTA}errol{RESET} {DIM}({elapsed:.1f}s){RESET} {full_content}")
+            # Clean up escaped newlines and format output
+            cleaned = full_content.replace("\\n", "\n").replace("\\t", "\t")
+            print(f"\n{MAGENTA}errol{RESET} {DIM}({elapsed:.1f}s){RESET}")
+            # Render markdown with rich
+            try:
+                from rich.console import Console
+                from rich.markdown import Markdown
+                console = Console()
+                md = Markdown(cleaned)
+                console.print(md)
+            except ImportError:
+                # Fallback if rich not installed
+                for line in cleaned.split("\n"):
+                    print(f"  {line}")
 
         # Add assistant message to history
         assistant_msg = {"role": "assistant", "content": full_content}
@@ -546,6 +639,8 @@ def agent_loop(task: str, config: dict, todos: TodoManager):
 
     if turn >= max_turns - 1:
         print(f"\n{YELLOW}⚠ Reached max turns ({max_turns}){RESET}")
+
+    return False
 
 
 @app.command()

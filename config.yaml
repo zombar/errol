@@ -9,3 +9,4 @@ models:
 
 agent:
   max_turns: 75
+  show_model_picker: false

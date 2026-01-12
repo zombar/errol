@@ -101,6 +101,15 @@ def test_edit_file_missing_new_string(r: TestResults):
         r.fail("edit_file_missing_new_string", f"Expected error about new_string, got: {result}")
 
 
+def test_edit_file_identical_strings(r: TestResults):
+    """edit_file should return error when old_string equals new_string."""
+    result = edit_file(path="/tmp/test.txt", old_string="same", new_string="same")
+    if "Error" in result and "identical" in result.lower():
+        r.ok("edit_file_identical_strings")
+    else:
+        r.fail("edit_file_identical_strings", f"Expected error about identical, got: {result}")
+
+
 def test_bash_missing_command(r: TestResults):
     """run_bash should return error when command is missing."""
     result = run_bash()
@@ -211,12 +220,12 @@ def test_glob_files_missing_pattern(r: TestResults):
 
 
 def test_looks_like_question_true(r: TestResults):
-    """looks_like_question should detect questions."""
+    """looks_like_question should detect questions requiring action."""
     test_cases = [
-        "Which file would you like to start with?",
-        "Please respond with your choice.",
-        "Let me know what you think.",
-        "Should I continue?",
+        "Which file should I start with?",
+        "Do you want me to continue?",
+        "Should I proceed with the changes?",
+        "Please select an option.",
     ]
     all_passed = True
     for text in test_cases:
@@ -229,11 +238,12 @@ def test_looks_like_question_true(r: TestResults):
 
 
 def test_looks_like_question_false(r: TestResults):
-    """looks_like_question should not detect non-questions."""
+    """looks_like_question should not detect completed responses."""
     test_cases = [
         "I have completed the task.",
-        "The file has been updated successfully.",
-        "Here is the documentation.",
+        "Here are the files in the directory.",
+        "The file has been created successfully.",
+        "Let me know if you need anything else.",  # Polite closing, not a question
         "",
     ]
     all_passed = True
@@ -260,6 +270,7 @@ def run_all_tests() -> TestResults:
     test_write_file_missing_path(r)
     test_edit_file_missing_old_string(r)
     test_edit_file_missing_new_string(r)
+    test_edit_file_identical_strings(r)
     test_bash_missing_command(r)
     test_bash_cmd_alias(r)
     test_bash_string_timeout(r)

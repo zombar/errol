@@ -82,6 +82,8 @@ def edit_file(path: str = None, old_string: str = None, new_string: str = None) 
             return "Error: 'old_string' parameter is required (the text to find and replace)"
         if new_string is None:
             return "Error: 'new_string' parameter is required (the replacement text)"
+        if old_string == new_string:
+            return "Error: old_string and new_string are identical - no change needed"
         p = Path(path).expanduser().resolve()
         if not p.exists():
             return f"Error: File not found: {path}"
