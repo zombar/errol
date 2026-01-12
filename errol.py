@@ -34,7 +34,6 @@ RL_END = "\002"    # End of non-printing sequence
 
 # Read-only tools that auto-execute after countdown
 READONLY_TOOLS = ("read_file", "glob")
-from router import Router
 from tools import execute_tool, get_tool_schemas, validate_tool_call, TOOLS
 
 
@@ -299,63 +298,9 @@ def load_config() -> dict:
         return yaml.safe_load(config_path.read_text())
     return {
         "ollama": {"host": "http://localhost:11434", "timeout": 300},
-        "models": {"small": "qwen2.5:3b", "medium": "qwen2.5:7b", "large": "qwen2.5-coder:14b"},
+        "model": "qwen2.5-coder:14b",
         "agent": {"max_turns": 20}
     }
-
-def select_model(config: dict, router: Router, task: str, available: list) -> str:
-    """Ask user to select a model with countdown auto-select."""
-    import termios
-    import tty
-
-    # Get suggested model from router
-    suggested, category = router.classify(task)
-    models = config["models"]
-
-    print(f"\n{DIM}Select model {RESET}{DIM}(suggested: {suggested}){RESET}")
-    print(f"  {DIM}[1]{RESET} {models['small']}")
-    print(f"  {DIM}[2]{RESET} {models['medium']}")
-    print(f"  {DIM}[3]{RESET} {models['large']}")
-
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
-
-    try:
-        tty.setcbreak(fd)
-        for i in range(3, 0, -1):
-            print(f"\r{DIM}[1/2/3] auto-select in {i}s{RESET} ", end="", flush=True)
-            ready, _, _ = select.select([sys.stdin], [], [], 1.0)
-            if ready:
-                ch = sys.stdin.read(1)
-                print()  # newline
-                if ch == "1":
-                    return models["small"]
-                elif ch == "2":
-                    return models["medium"]
-                elif ch == "3":
-                    return models["large"]
-                else:
-                    return suggested
-        print("\r" + " " * 40 + "\r", end="", flush=True)
-        return suggested
-    except (termios.error, OSError):
-        # Fallback for non-TTY (e.g., piped input)
-        try:
-            choice = input("Choice [1/2/3/Enter]: ").strip()
-        except EOFError:
-            choice = ""
-        if choice == "1":
-            return models["small"]
-        elif choice == "2":
-            return models["medium"]
-        elif choice == "3":
-            return models["large"]
-        return suggested
-    finally:
-        try:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-        except (termios.error, OSError):
-            pass
 
 def preview_file_change(name: str, args: dict) -> str:
     """Generate a diff preview for file operations."""
@@ -465,29 +410,21 @@ def agent_loop(task: str, config: dict) -> bool:
         host=config["ollama"]["host"],
         timeout=config["ollama"]["timeout"]
     )
-    router = Router(client, config["models"])
 
     # Check Ollama is running
     if not client.is_available():
         print("Error: Ollama not available. Start it with: ollama serve")
         return False
 
-    # Check configured models are available
+    # Check configured model is available
+    model = config["model"]
     available = client.list_models()
-    configured = set(config["models"].values())
-    missing = configured - set(available)
-    if missing:
-        print(f"Warning: Missing models: {', '.join(missing)}")
-        print(f"Pull with: ollama pull <model>")
+    if model not in available:
+        print(f"Warning: Model '{model}' not found")
+        print(f"Pull with: ollama pull {model}")
         print(f"Available: {', '.join(sorted(available))}")
         return False
 
-    # Select model (skip picker if disabled in config)
-    if config["agent"].get("show_model_picker", True):
-        model = select_model(config, router, task, available)
-    else:
-        # Use router's suggestion directly
-        model, _ = router.classify(task)
     print(f"\n{MAGENTA}▶ errol{RESET} {DIM}using {model}{RESET}")
 
     # Build system prompt
@@ -665,9 +602,7 @@ def models():
     for m in client.list_models():
         print(f"  - {m}")
 
-    print("\nConfigured models:")
-    for tier, model in config["models"].items():
-        print(f"  {tier}: {model}")
+    print(f"\nConfigured model: {config['model']}")
 
 
 @app.command()

@@ -2,11 +2,7 @@ ollama:
   host: http://localhost:11434
   timeout: 300
 
-models:
-  small: gpt-oss:20b
-  medium: gpt-oss:20b
-  large: gpt-oss:20b
+model: gpt-oss:20b
 
 agent:
   max_turns: 75
-  show_model_picker: false
