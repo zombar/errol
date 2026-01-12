@@ -8,7 +8,7 @@ This app is designed to be run on a mac (preferably M4/M5) using the binaries th
 
 ```bash
 # Install dependencies
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 
 # Pull Ollama models
 ollama pull gpt-oss:20b
