@@ -7,7 +7,10 @@ from tools import (
     read_file, write_file, edit_file, run_bash, glob_files,
     execute_tool
 )
-from errol import parse_tool_calls_from_text, extract_json_objects, looks_like_question
+from errol import (
+    parse_tool_calls_from_text, extract_json_objects, looks_like_question,
+    DIM, RESET, GREEN, RED, YELLOW
+)
 
 
 class TestResults:
@@ -18,12 +21,12 @@ class TestResults:
 
     def ok(self, name):
         self.passed += 1
-        print(f"  OK: {name}")
+        print(f"  {GREEN}✓{RESET} {DIM}{name}{RESET}")
 
     def fail(self, name, msg):
         self.failed += 1
         self.errors.append((name, msg))
-        print(f"  FAIL: {name} - {msg}")
+        print(f"  {RED}✗{RESET} {name} {DIM}- {msg}{RESET}")
 
 
 def test_read_file_missing_path(r: TestResults):
@@ -261,8 +264,6 @@ def test_looks_like_question_false(r: TestResults):
 def run_all_tests() -> TestResults:
     """Run all tests and return results."""
     r = TestResults()
-
-    print("\nRunning tool tests...")
 
     # Parameter validation tests
     test_read_file_missing_path(r)

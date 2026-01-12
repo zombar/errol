@@ -675,38 +675,38 @@ def self_check():
     """Validate Errol's own Python files and run unit tests."""
     import py_compile
 
+    print(f"\n{MAGENTA}▶ errol{RESET} {DIM}self-check{RESET}")
+
     # Step 1: Syntax check
-    print("Checking Python syntax...")
+    print(f"\n{CYAN}◆{RESET} {BOLD}Syntax Check{RESET}")
     files = list(SELF_PATH.glob("*.py"))
     syntax_errors = []
 
     for f in files:
         try:
             py_compile.compile(str(f), doraise=True)
-            print(f"  OK: {f.name}")
+            print(f"  {GREEN}✓{RESET} {DIM}{f.name}{RESET}")
         except py_compile.PyCompileError as e:
-            print(f"  ERROR: {f.name}: {e}")
+            print(f"  {RED}✗{RESET} {f.name}: {e}")
             syntax_errors.append(f)
 
     if syntax_errors:
-        print(f"\n{len(syntax_errors)} file(s) have syntax errors")
+        print(f"\n{RED}✗{RESET} {len(syntax_errors)} file(s) have syntax errors")
         sys.exit(1)
-    else:
-        print(f"All {len(files)} files OK")
 
     # Step 2: Run unit tests
+    print(f"\n{CYAN}◆{RESET} {BOLD}Unit Tests{RESET}")
     from test_tools import run_all_tests
     results = run_all_tests()
 
-    print(f"\n{results.passed} tests passed, {results.failed} failed")
-
     if results.failed > 0:
-        print("\nTest failures:")
+        print(f"\n{RED}✗{RESET} {results.passed} passed, {results.failed} failed")
+        print(f"\n{DIM}Failures:{RESET}")
         for name, msg in results.errors:
-            print(f"  {name}: {msg}")
+            print(f"  {RED}✗{RESET} {name}: {DIM}{msg}{RESET}")
         sys.exit(1)
 
-    print("\nAll checks passed!")
+    print(f"\n{GREEN}✓{RESET} All {results.passed} tests passed")
 
 
 if __name__ == "__main__":
