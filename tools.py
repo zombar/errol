@@ -36,6 +36,8 @@ def read_file(path: str = None, offset: int = None, limit: int = None) -> str:
     try:
         if not path:
             return "Error: 'path' parameter is required"
+        # Strip whitespace - models sometimes add leading/trailing spaces
+        path = path.strip()
         # Handle None, "null" string, and type conversions from JSON
         if offset is None or offset == "null":
             offset = 0
@@ -64,6 +66,7 @@ def write_file(path: str = None, content: str = None) -> str:
     try:
         if not path:
             return "Error: 'path' parameter is required"
+        path = path.strip()
         if content is None:
             return "Error: 'content' parameter is required (the text to write to the file)"
         p = Path(path).expanduser().resolve()
@@ -78,6 +81,7 @@ def edit_file(path: str = None, old_string: str = None, new_string: str = None) 
     try:
         if not path:
             return "Error: 'path' parameter is required"
+        path = path.strip()
         if old_string is None:
             return "Error: 'old_string' parameter is required (the text to find and replace)"
         if new_string is None:
@@ -142,6 +146,9 @@ def glob_files(pattern: str = None, path: str = ".") -> str:
     try:
         if not pattern:
             return "Error: 'pattern' parameter is required"
+        # Strip whitespace - models sometimes add leading/trailing spaces
+        path = path.strip() if path else "."
+        pattern = pattern.strip() if pattern else pattern
         base = Path(path).expanduser().resolve()
         matches = list(base.glob(pattern))
         matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)

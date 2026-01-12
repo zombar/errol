@@ -149,6 +149,47 @@ class TodoManager:
 
         return "\n\n".join(context_parts)
 
+    def enrich_dependent_tasks(self, completed_id: str) -> None:
+        """After a task completes, enrich dependent task descriptions with discoveries."""
+        completed = self.items.get(completed_id)
+        if not completed or not completed.get("result"):
+            return
+
+        result = completed["result"]
+        artifacts = completed.get("artifacts", [])
+
+        # Extract file discoveries from result
+        import re
+        # Find .py, .md, .js, .ts files mentioned
+        file_pattern = r'\b([\w./]+\.(?:py|md|js|ts|go|yaml|json))\b'
+        files_found = list(set(re.findall(file_pattern, result)))
+
+        # Also include artifacts
+        files_found.extend(artifacts)
+        files_found = list(set(files_found))
+
+        if not files_found:
+            return
+
+        # Update dependent tasks that are still pending
+        for task_id, task in self.items.items():
+            if task["status"] != "pending":
+                continue
+            if completed_id not in task.get("dependencies", []):
+                continue
+
+            # Enrich the task content with discovered files
+            content = task["content"]
+            # Only enrich if task mentions reading/analyzing and doesn't already have specific files
+            if any(word in content.lower() for word in ["read", "analyze", "examine", "find"]):
+                if not any(f in content for f in files_found[:3]):
+                    # Add key files to the task description
+                    key_files = ", ".join(files_found[:5])
+                    enriched = f"{content}\n[Key files from dependencies: {key_files}]"
+                    self.items[task_id]["content"] = enriched
+
+        self.save()
+
     def has_pending_tasks(self) -> bool:
         """Check if there are any pending tasks."""
         return any(item["status"] == "pending" for item in self.items.values())

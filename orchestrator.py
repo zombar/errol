@@ -12,26 +12,39 @@ PLANNING_PROMPT = """You are a task planner. Break down the user's request into 
 For each subtask, output a JSON object on its own line:
 {{"action": "add_task", "content": "task description", "tier": "small|medium|large", "depends_on": []}}
 
-Tier guidelines:
+## Available Tools (workers can use these):
+- read_file: Read file contents
+- write_file: Create or overwrite a file with new content
+- edit_file: Find and replace a specific string in a file (reads, modifies, and writes in ONE step)
+- bash: Run shell commands
+- glob: Find files by pattern
+
+## Tier Guidelines:
 - small: File listing, glob, simple reads, quick checks
-- medium: Reading and analyzing files, explanations
-- large: Writing code, generating content, complex edits
+- medium: Reading and analyzing files, simple edits, explanations
+- large: Writing code, generating content, complex multi-step edits
+
+## Planning Principles:
+- MINIMAL TASKS: Create only necessary tasks. Don't over-plan.
+- For simple file edits: ONE task using edit_file is enough (it reads, modifies, writes in one step)
+- Don't create separate "read file" and "write file" tasks when edit_file can do both
+- Only create dependencies when truly needed
 
 The depends_on field should list indices (0-based) of tasks that must complete first.
-
-IMPORTANT: For documentation tasks, always plan to:
-1. First discover ALL source files in the repo (*.py, *.js, *.ts, *.go, etc.)
-2. Read the actual source code files to understand what they do
-3. Then generate documentation based on the code content
 
 After all tasks, output:
 {{"action": "done"}}
 
-Example for "document this repo":
+## Examples:
+
+Simple edit "change X to Y in file.py":
+{{"action": "add_task", "content": "Use edit_file to change X to Y in file.py", "tier": "small", "depends_on": []}}
+{{"action": "done"}}
+
+Complex task "document this repo":
 {{"action": "add_task", "content": "Find all source files (*.py, *.js, *.ts, etc.)", "tier": "small", "depends_on": []}}
 {{"action": "add_task", "content": "Read and analyze the main entry point and core modules", "tier": "medium", "depends_on": [0]}}
-{{"action": "add_task", "content": "Read and analyze utility/helper modules", "tier": "medium", "depends_on": [0]}}
-{{"action": "add_task", "content": "Write comprehensive documentation with actual content to DOCS.md", "tier": "large", "depends_on": [1, 2]}}
+{{"action": "add_task", "content": "Write comprehensive documentation to DOCS.md", "tier": "large", "depends_on": [1]}}
 {{"action": "done"}}
 
 Now break down this request:

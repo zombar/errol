@@ -5,6 +5,7 @@ import sys
 import select
 import threading
 from pathlib import Path
+from typing import Optional
 
 from llm import OllamaClient
 from todos import TodoManager
@@ -50,25 +51,85 @@ class ThinkingTimer:
         print("\r" + " " * 30 + "\r", end="", flush=True)
         return elapsed
 
+
+class SessionState:
+    """Track what's been done during task execution to prevent loops."""
+    def __init__(self):
+        self.files_read: dict[str, str] = {}  # path -> full content (for re-serving)
+        self.files_summary: dict[str, str] = {}  # path -> summary (for session state display)
+        self.globs_cache: dict[str, str] = {}  # "pattern|path" -> result
+        self.globs_done: list[str] = []
+        self.commands_run: list[str] = []
+
+    def record_read(self, path: str, content: str):
+        # Store full content for re-serving with different offsets
+        self.files_read[path] = content
+        # Store summary for session state display
+        lines = content.split('\n')
+        self.files_summary[path] = f"{len(lines)} lines"
+
+    def record_glob(self, pattern: str, path: str, results: str):
+        cache_key = f"{pattern}|{path}"
+        self.globs_cache[cache_key] = results
+        self.globs_done.append(f"{pattern} -> {results[:100]}")
+
+    def get_cached_glob(self, pattern: str, path: str) -> Optional[str]:
+        cache_key = f"{pattern}|{path}"
+        return self.globs_cache.get(cache_key)
+
+    def record_bash(self, command: str):
+        self.commands_run.append(command[:100])
+
+    def invalidate(self, path: str):
+        """Remove a file from cache (after edit/write)."""
+        if path in self.files_read:
+            del self.files_read[path]
+        if path in self.files_summary:
+            del self.files_summary[path]
+
+    def get_cached_slice(self, path: str, offset: int, limit: int) -> Optional[str]:
+        """Return cached content slice, or None if not cached."""
+        if path not in self.files_read:
+            return None
+        lines = self.files_read[path].split('\n')
+        selected = lines[offset:offset + limit]
+        numbered = [f"{i + offset + 1}\t{line}" for i, line in enumerate(selected)]
+        return "\n".join(numbered)
+
+    def get_summary(self) -> str:
+        parts = []
+        if self.files_summary:
+            files_info = [f"{p} ({s})" for p, s in self.files_summary.items()]
+            parts.append(f"Files already read: {', '.join(files_info)}")
+        if self.globs_done:
+            parts.append(f"Globs completed: {len(self.globs_done)}")
+        if self.commands_run:
+            parts.append(f"Commands run: {len(self.commands_run)}")
+        return "\n".join(parts) if parts else ""
+
+
 WORKER_PROMPT = """You are executing a specific task. Focus only on this task.
 
 Task: {task_content}
 
 {context_section}
 
-You have these tools:
-- read_file: Read file contents
-- write_file: Write/create files
-- edit_file: Edit files (find/replace unique strings)
-- bash: Run shell commands
-- glob: Find files by pattern
+## Available Tools (ONLY use these - no others exist):
+- read_file(path, offset, limit): Read file contents
+- write_file(path, content): Create or overwrite files
+- edit_file(path, old_string, new_string): Replace unique string in file
+- bash(command, timeout): Run shell commands
+- glob(pattern, path): Find files matching pattern
 
-Guidelines:
+IMPORTANT: These are the ONLY tools. Do not try "search", "grep", "find_file", or any other tool names.
+
+## Guidelines
 - Call ONE tool at a time and wait for the result
+- Do NOT re-read files you've already read - use the content from earlier
 - Never use placeholders - use actual values
-- Complete the task, then provide a summary of what you did
-
-When done, end your response with:
+- Complete the task, then provide a summary
+{session_state}
+When done, end with:
 RESULT: <brief summary of what was accomplished>
 ARTIFACTS: <comma-separated list of files created/modified, or "none">
 """
@@ -135,8 +196,16 @@ def countdown_confirm(seconds: int = 3) -> bool:
     import termios
     import tty
 
+    # If stdin is not a tty (piped input), auto-confirm
+    if not sys.stdin.isatty():
+        return True
+
     fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
+    try:
+        old_settings = termios.tcgetattr(fd)
+    except termios.error:
+        # Can't get terminal settings, auto-confirm
+        return True
 
     try:
         tty.setcbreak(fd)
@@ -208,6 +277,55 @@ def confirm_tool(name: str, args: dict) -> bool:
     return confirm in ("y", "yes")
 
 
+def execute_with_cache(name: str, args: dict, session: SessionState) -> str:
+    """Execute tool with caching for read_file to prevent loops."""
+    path = args.get("path", "")
+
+    # Parse offset/limit for read_file
+    if name == "read_file":
+        offset = args.get("offset", 0) or 0
+        limit = args.get("limit", 2000) or 2000
+        if isinstance(offset, str):
+            offset = int(offset) if offset != "null" else 0
+        if isinstance(limit, str):
+            limit = int(limit) if limit != "null" else 2000
+
+        # Serve from cache if available
+        if path in session.files_read:
+            cached = session.get_cached_slice(path, offset, limit)
+            return f"[CACHED] {cached}"
+
+        # First read: fetch FULL file to cache, then return requested slice
+        full_result = execute_tool(name, {"path": path})  # No offset/limit = full file
+        if not full_result.startswith("Error"):
+            session.record_read(path, full_result)
+            # Return the slice that was actually requested
+            return session.get_cached_slice(path, offset, limit)
+        return full_result
+
+    # Check cache for glob
+    if name == "glob":
+        pattern = args.get("pattern", "")
+        glob_path = args.get("path", ".")
+        cached_glob = session.get_cached_glob(pattern, glob_path)
+        if cached_glob is not None:
+            return f"[CACHED] {cached_glob}"
+
+    result = execute_tool(name, args)
+
+    # Invalidate cache on file modifications
+    if name in ("edit_file", "write_file"):
+        session.invalidate(path)
+
+    # Record for session tracking
+    if name == "glob":
+        session.record_glob(args.get("pattern", ""), args.get("path", "."), result)
+    elif name == "bash":
+        session.record_bash(args.get("command", ""))
+
+    return result
+
+
 def execute_task(task_id: str, todos: TodoManager, client: OllamaClient,
                  models: dict, max_turns: int = 20) -> bool:
     """Execute a single task and store results."""
@@ -231,14 +349,23 @@ def execute_task(task_id: str, todos: TodoManager, client: OllamaClient,
     print(f"{DIM}Executing: {task['content']}{RESET}")
     print(f"{DIM}Using {model} ({tier}){RESET}")
 
+    # Initialize session state for tracking
+    session = SessionState()
+
     # Build context from dependencies
     context = todos.get_context_for_task(task_id)
     context_section = f"Context from previous tasks:\n{context}" if context else ""
 
-    system = WORKER_PROMPT.format(
-        task_content=task["content"],
-        context_section=context_section
-    )
+    def build_system_prompt():
+        session_summary = session.get_summary()
+        session_state = f"\n## Session State\n{session_summary}\n" if session_summary else ""
+        return WORKER_PROMPT.format(
+            task_content=task["content"],
+            context_section=context_section,
+            session_state=session_state
+        )
+
+    system = build_system_prompt()
 
     messages = [
         {"role": "system", "content": system},
@@ -251,6 +378,9 @@ def execute_task(task_id: str, todos: TodoManager, client: OllamaClient,
     timer = ThinkingTimer()
 
     for turn in range(max_turns):
+        # Update system prompt with current session state
+        messages[0]["content"] = build_system_prompt()
+
         timer.start()
         response = client.chat_sync(model, messages, tools=tools)
         elapsed = timer.stop()
@@ -284,7 +414,7 @@ def execute_task(task_id: str, todos: TodoManager, client: OllamaClient,
                         args = {}
 
                 if confirm_tool(name, args):
-                    result = execute_tool(name, args)
+                    result = execute_with_cache(name, args, session)
                     print(f"{GREEN}✓{RESET} {DIM}{result[:500]}{'...' if len(result) > 500 else ''}{RESET}")
                 else:
                     result = "Tool execution skipped by user"
@@ -305,6 +435,9 @@ def execute_task(task_id: str, todos: TodoManager, client: OllamaClient,
 
     todos.set_result(task_id, result_summary, artifacts)
     todos.complete(task_id)
+
+    # Enrich dependent tasks with discoveries from this task
+    todos.enrich_dependent_tasks(task_id)
 
     print(f"\n{GREEN}✓{RESET} {DIM}Task complete: {task_id}{RESET}")
     if artifacts:
