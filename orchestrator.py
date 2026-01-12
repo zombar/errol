@@ -4,6 +4,9 @@ import re
 from llm import OllamaClient
 from todos import TodoManager
 
+DIM = "\033[2m"
+RESET = "\033[0m"
+
 PLANNING_PROMPT = """You are a task planner. Break down the user's request into subtasks.
 
 For each subtask, output a JSON object on its own line:
@@ -86,10 +89,10 @@ def plan_task(task: str, todos: TodoManager, client: OllamaClient, model: str) -
 def display_plan(tasks: list[dict], todos: TodoManager) -> None:
     """Display the planned tasks for user review."""
     if not tasks:
-        print("\n[orchestrator] No tasks created.")
+        print(f"\n{DIM}No tasks created.{RESET}")
         return
 
-    print("\n[orchestrator] Proposed tasks:\n")
+    print(f"\n{DIM}Proposed tasks:{RESET}\n")
     for task in tasks:
         deps = task.get("dependencies", [])
         dep_str = ""

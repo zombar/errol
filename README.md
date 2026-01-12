@@ -9,9 +9,8 @@ A minimal, self-modifying MoE (Mixture of Experts) local LLM agent using Ollama.
 pip install -r requirements.txt
 
 # Pull Ollama models
-ollama pull qwen2.5:3b
-ollama pull qwen2.5:7b
-ollama pull qwen2.5-coder:14b
+# The project now uses the gpt-oss:20b model for all tiers
+ollama pull gpt-oss:20b
 
 # Start Ollama
 ollama serve
@@ -61,11 +60,11 @@ errol self-check
 
 ## Model Routing
 
-| Tier   | Model              | Use Case                          |
+| Tier   | Model              | Use Case                           |
 |--------|--------------------|------------------------------------|
-| Small  | qwen2.5:3b         | Routing, todos, file reads         |
-| Medium | qwen2.5:7b         | Explanations, small edits          |
-| Large  | qwen2.5-coder:14b  | Code generation, refactors         |
+| Small  | gpt-oss:20b        | Routing, todos, file reads         |
+| Medium | gpt-oss:20b        | Explanations, small edits          |
+| Large  | gpt-oss:20b        | Code generation, refactors         |
 
 ## Self-Modification
 
@@ -75,7 +74,7 @@ Errol knows its own source location and can modify itself:
 errol chat "add a new tool called 'search_code' to tools.py"
 ```
 
-All file changes show a git-style diff and require confirmation before applying.
+All file changes show a git‑style diff and require confirmation before applying.
 
 ## Configuration
 
@@ -87,10 +86,11 @@ ollama:
   timeout: 300
 
 models:
-  small: qwen2.5:3b
-  medium: qwen2.5:7b
-  large: qwen2.5-coder:14b
+  small: gpt-oss:20b
+  medium: gpt-oss:20b
+  large: gpt-oss:20b
 
 agent:
   max_turns: 75
+  show_model_picker: false
 ```

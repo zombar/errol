@@ -13,6 +13,10 @@ from tools import execute_tool, get_tool_schemas, show_diff
 # ANSI colors
 DIM = "\033[2m"
 RESET = "\033[0m"
+MAGENTA = "\033[95m"
+CYAN = "\033[96m"
+GREEN = "\033[92m"
+YELLOW = "\033[93m"
 
 # Read-only tools that auto-execute
 READONLY_TOOLS = ("read_file", "glob")
@@ -34,7 +38,7 @@ class ThinkingTimer:
     def _run(self):
         while self.running:
             elapsed = time.time() - self.start_time
-            print(f"\r[thinking... {elapsed:.1f}s] ", end="", flush=True)
+            print(f"\r{DIM}thinking... {elapsed:.1f}s{RESET} ", end="", flush=True)
             time.sleep(0.1)
 
     def stop(self) -> float:
@@ -209,11 +213,11 @@ def execute_task(task_id: str, todos: TodoManager, client: OllamaClient,
     """Execute a single task and store results."""
     task = todos.get(task_id)
     if not task:
-        print(f"[worker] Task {task_id} not found")
+        print(f"{DIM}Task {task_id} not found{RESET}")
         return False
 
     if task["status"] == "complete":
-        print(f"[worker] Task {task_id} already complete")
+        print(f"{DIM}Task {task_id} already complete{RESET}")
         return True
 
     # Mark as in progress
@@ -223,8 +227,9 @@ def execute_task(task_id: str, todos: TodoManager, client: OllamaClient,
     tier = task.get("tier", "medium")
     model = models.get(tier, models.get("medium"))
 
-    print(f"\n[worker] Executing: {task['content']}")
-    print(f"[worker] Using {model} ({tier})")
+    print(f"\n{MAGENTA}▶ errol{RESET} {DIM}worker mode{RESET}")
+    print(f"{DIM}Executing: {task['content']}{RESET}")
+    print(f"{DIM}Using {model} ({tier}){RESET}")
 
     # Build context from dependencies
     context = todos.get_context_for_task(task_id)
@@ -259,7 +264,9 @@ def execute_task(task_id: str, todos: TodoManager, client: OllamaClient,
             tool_calls = parse_tool_calls_from_text(content)
 
         # Dim LLM output to distinguish from tool output
-        print(f"[worker {elapsed:.1f}s] {DIM}{content}{RESET}")
+        print(f"\n{MAGENTA}errol{RESET} {DIM}({elapsed:.1f}s){RESET}")
+        if content:
+            print(f"{DIM}{content}{RESET}")
         full_output.append(content)
 
         messages.append({"role": "assistant", "content": content, "tool_calls": tool_calls if tool_calls else None})
@@ -278,10 +285,10 @@ def execute_task(task_id: str, todos: TodoManager, client: OllamaClient,
 
                 if confirm_tool(name, args):
                     result = execute_tool(name, args)
-                    print(f"[result] {result[:500]}{'...' if len(result) > 500 else ''}")
+                    print(f"{GREEN}✓{RESET} {DIM}{result[:500]}{'...' if len(result) > 500 else ''}{RESET}")
                 else:
                     result = "Tool execution skipped by user"
-                    print("[skipped]")
+                    print(f"{YELLOW}○ skipped{RESET}")
 
                 messages.append({"role": "tool", "content": result})
         else:
@@ -299,9 +306,9 @@ def execute_task(task_id: str, todos: TodoManager, client: OllamaClient,
     todos.set_result(task_id, result_summary, artifacts)
     todos.complete(task_id)
 
-    print(f"\n[worker] Task complete: {task_id}")
+    print(f"\n{GREEN}✓{RESET} {DIM}Task complete: {task_id}{RESET}")
     if artifacts:
-        print(f"[worker] Artifacts: {', '.join(artifacts)}")
+        print(f"{DIM}Artifacts: {', '.join(artifacts)}{RESET}")
 
     return True
 

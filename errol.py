@@ -841,22 +841,27 @@ def plan(task: str = typer.Argument(..., help="Task to break down into subtasks"
 
     # Use small model to plan
     small_model = config["models"]["small"]
-    print(f"\n[orchestrator] Planning with {small_model}...")
+    print(f"\n{MAGENTA}▶ errol{RESET} {DIM}plan mode{RESET}")
+    print(f"{DIM}Planning with {small_model}...{RESET}")
 
     tasks = plan_task(task, todos, client, small_model)
 
     if not tasks:
-        print("[orchestrator] No tasks generated. Try rephrasing your request.")
+        print(f"{DIM}No tasks generated. Try rephrasing your request.{RESET}")
         return
 
     display_plan(tasks, todos)
 
     # User review
+    print(f"{DIM}[e]dit  [a]pprove  [c]ancel  (Ctrl+C to exit){RESET}")
     while True:
         try:
-            choice = input("[e]dit  [a]pprove  [c]ancel: ").strip().lower()
-        except EOFError:
-            choice = "c"
+            choice = interactive_input(f"{CYAN}▷{RESET} ", "").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            todos.clear_all()
+            print(f"{DIM}Cancelled.{RESET}")
+            return
 
         if choice in ("a", "approve", ""):
             break
@@ -865,15 +870,15 @@ def plan(task: str = typer.Argument(..., help="Task to break down into subtasks"
             display_plan(todos.list(status="pending"), todos)
         elif choice in ("c", "cancel"):
             todos.clear_all()
-            print("[orchestrator] Cancelled.")
+            print(f"{DIM}Cancelled.{RESET}")
             return
         else:
-            print("Unknown choice")
+            print(f"{DIM}Unknown choice{RESET}")
 
     # Auto-execute
-    print("\n[orchestrator] Starting execution...\n")
+    print(f"\n{DIM}Starting execution...{RESET}\n")
     completed = work_all(todos, client, config["models"])
-    print(f"\n[orchestrator] Completed {completed} task(s).")
+    print(f"\n{DIM}Completed {completed} task(s).{RESET}")
 
 
 @app.command()
