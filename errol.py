@@ -16,7 +16,6 @@ from typing import Optional
 import re
 import select
 from llm import OllamaClient
-from context_tracker import ContextTracker
 
 # ANSI colors for styled output
 DIM = "\033[2m"
@@ -34,8 +33,8 @@ RL_START = "\001"  # Start of non-printing sequence
 RL_END = "\002"    # End of non-printing sequence
 
 # Read-only tools that auto-execute after countdown
-READONLY_TOOLS = ("read_file", "glob", "grep")
-from tools import execute_tool, get_tool_schemas, validate_tool_call, TOOLS, _fix_indentation
+READONLY_TOOLS = ("read_file", "glob")
+from tools import execute_tool, get_tool_schemas, validate_tool_call, TOOLS
 
 
 def looks_like_question(text: str) -> bool:
@@ -285,18 +284,6 @@ IMPORTANT: These are the ONLY tools. Do not try "search", "container.exec", "rep
 - If the user asks to add/modify something, DO that - don't analyze instead
 - When the task is clear, proceed without asking "what do you want me to do"
 
-## CRITICAL: Actually Make Changes
-- To modify files, you MUST call edit_file or write_file - describing changes is NOT enough
-- NEVER show a diff or code block and claim you made changes without calling a tool
-- NEVER say "File updated" or "I added" unless you actually called edit_file/write_file
-- If you want to change code, call the tool. Do not just show what the change would look like.
-
-## CRITICAL: Do NOT Repeat Yourself
-- NEVER re-read a file you have already read - the system will warn you
-- NEVER repeat the same grep/glob search twice
-- If you need to recall earlier information, check the CONTEXT REMINDER when provided
-- Each tool call must make NEW progress toward the goal
-
 ## Rules:
 - Call ONE tool at a time, wait for result
 
@@ -304,9 +291,6 @@ IMPORTANT: These are the ONLY tools. Do not try "search", "container.exec", "rep
 After gathering information, you MUST directly address the user's original request.
 Do not summarize what you read - do what the user asked.
 """
-
-# How often to inject context reminders (every N tool calls)
-REMINDER_INTERVAL = 5
 
 def load_config() -> dict:
     """Load config from yaml file."""
@@ -335,19 +319,9 @@ def preview_file_change(name: str, args: dict) -> str:
             return ""
         content = p.read_text()
         count = content.count(old_string)
-        replace_all = args.get("replace_all", False)
-        if count >= 1:
-            # Fix indentation in preview to show what will actually be applied
-            fixed_new = _fix_indentation(old_string, new_string)
-            if replace_all:
-                new_content = content.replace(old_string, fixed_new)
-            else:
-                # Replace only first occurrence
-                new_content = content.replace(old_string, fixed_new, 1)
-            diff = show_diff(content, new_content, p.name)
-            if count > 1 and not replace_all:
-                diff += f"\n{YELLOW}(replacing first of {count} occurrences){RESET}"
-            return diff
+        if count == 1:
+            new_content = content.replace(old_string, new_string)
+            return show_diff(content, new_content, p.name)
         elif count == 0:
             # String not found - try to find close matches
             lines = content.splitlines()
@@ -358,6 +332,8 @@ def preview_file_change(name: str, args: dict) -> str:
                 if matches:
                     return f"{RED}String not found.{RESET} Similar line exists:\n{DIM}{matches[0]}{RESET}\n{YELLOW}Check indentation/whitespace.{RESET}"
             return f"{RED}String not found in file.{RESET} {YELLOW}Check indentation/whitespace.{RESET}"
+        else:
+            return f"{YELLOW}String found {count} times (must be unique).{RESET}"
     elif name == "write_file":
         new_content = args.get("content", "")
         if p.exists() and p.is_file():
@@ -460,15 +436,11 @@ def agent_loop(task: str, config: dict) -> bool:
         {"role": "user", "content": task}
     ]
 
-    # Initialize context tracker
-    tracker = ContextTracker(task)
-
     tools = get_tool_schemas()
     max_turns = config["agent"]["max_turns"]
     timer = Timer()
     reprompt_count = 0
     max_reprompts = 5
-    tool_call_count = 0
 
     for turn in range(max_turns):
         # Get response (non-streaming for reliable tool calls)
@@ -548,30 +520,6 @@ def agent_loop(task: str, config: dict) -> bool:
                     except:
                         args = {}
 
-                # Check for duplicate operations before validation
-                if name == "read_file":
-                    path = args.get("path", "")
-                    offset = args.get("offset", 0) or 0
-                    if tracker.is_duplicate_read(path, offset):
-                        print(f"\n{DIM}{'─'*60}{RESET}")
-                        print(f"{CYAN}◆{RESET} {name}")
-                        print(f"{DIM}{'─'*60}{RESET}")
-                        print(f"{YELLOW}⚠ Already read this file{RESET}")
-                        result = f"WARNING: You already read {path}. Use the information from before. Do NOT re-read files."
-                        messages.append({"role": "tool", "content": result})
-                        continue
-
-                if name in ("grep", "glob"):
-                    pattern = args.get("pattern", "")
-                    if tracker.is_duplicate_search(name, pattern):
-                        print(f"\n{DIM}{'─'*60}{RESET}")
-                        print(f"{CYAN}◆{RESET} {name}")
-                        print(f"{DIM}{'─'*60}{RESET}")
-                        print(f"{YELLOW}⚠ Already performed this search{RESET}")
-                        result = f"WARNING: You already searched for '{pattern}'. Use the results from before. Do NOT repeat searches."
-                        messages.append({"role": "tool", "content": result})
-                        continue
-
                 # Validate before prompting
                 validation_error = validate_tool_call(name, args)
                 if validation_error:
@@ -580,14 +528,6 @@ def agent_loop(task: str, config: dict) -> bool:
                     print(f"{DIM}{'─'*60}{RESET}")
                     print(f"{RED}✗ Error: {validation_error}{RESET}")
                     result = f"Error: {validation_error}"
-                    # For unknown tools, add forceful user message to make LLM retry correctly
-                    if "Unknown tool" in validation_error:
-                        messages.append({"role": "tool", "content": result})
-                        messages.append({
-                            "role": "user",
-                            "content": f"STOP. The tool '{name}' does not exist. You MUST use one of: read_file, write_file, edit_file, bash, glob, grep. Try again with a valid tool."
-                        })
-                        continue  # Skip adding result again below
                 elif confirm_tool(name, args):
                     result = execute_tool(name, args)
                     # Only treat as error if starts with "Error" (not if content contains it)
@@ -595,10 +535,6 @@ def agent_loop(task: str, config: dict) -> bool:
                         print(f"{RED}✗{RESET} {result[:500]}{'...' if len(result) > 500 else ''}")
                     else:
                         print(f"{GREEN}✓{RESET} {DIM}{result[:500]}{'...' if len(result) > 500 else ''}{RESET}")
-
-                    # Track the tool result
-                    tracker.record_tool_result(name, args, result)
-                    tool_call_count += 1
                 else:
                     result = "Tool execution skipped by user"
                     print(f"{YELLOW}○ skipped{RESET}")
@@ -608,15 +544,6 @@ def agent_loop(task: str, config: dict) -> bool:
                     "role": "tool",
                     "content": result
                 })
-
-                # Inject context reminder periodically
-                if tool_call_count > 0 and tool_call_count % REMINDER_INTERVAL == 0:
-                    reminder = tracker.get_simple_reminder()
-                    print(f"{DIM}📋 Injecting context reminder (turn {tool_call_count}){RESET}")
-                    messages.append({
-                        "role": "user",
-                        "content": reminder
-                    })
         else:
             # No tool calls - check if model is asking a question
             if looks_like_question(full_content) and reprompt_count < max_reprompts:

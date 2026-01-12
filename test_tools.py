@@ -166,12 +166,12 @@ def test_execute_tool_filters_invalid_args(r: TestResults):
 
 
 def test_execute_tool_unknown_tool(r: TestResults):
-    """execute_tool should return error for unknown tool with tool list."""
+    """execute_tool should return error for unknown tool."""
     result = execute_tool("nonexistent_tool", {})
-    if "Error" in result and "Unknown tool" in result and "edit_file" in result:
+    if "Error" in result and "Unknown tool" in result:
         r.ok("execute_tool_unknown_tool")
     else:
-        r.fail("execute_tool_unknown_tool", f"Expected unknown tool error with tool list, got: {result}")
+        r.fail("execute_tool_unknown_tool", f"Expected unknown tool error, got: {result}")
 
 
 def test_extract_json_nested(r: TestResults):
@@ -261,194 +261,6 @@ def test_looks_like_question_false(r: TestResults):
         r.ok("looks_like_question_false")
 
 
-def test_edit_file_multiline_indentation_fix(r: TestResults):
-    """edit_file should fix missing indentation on multi-line edits."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write("def foo():\n    x = 1\n    return x\n")
-        path = f.name
-    try:
-        # Simulate LLM forgetting indent on second line
-        result = edit_file(
-            path=path,
-            old_string="    x = 1",
-            new_string="    x = 1\ny = 2"  # Second line has 0 indent
-        )
-        content = Path(path).read_text()
-        if "    y = 2" in content:  # Should have 4-space indent
-            r.ok("edit_file_multiline_indentation_fix")
-        else:
-            r.fail("edit_file_multiline_indentation_fix",
-                   f"Expected '    y = 2', got: {content}")
-    finally:
-        os.unlink(path)
-
-
-def test_edit_file_preserves_correct_indentation(r: TestResults):
-    """edit_file should not modify already-correct indentation."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write("def foo():\n    x = 1\n    return x\n")
-        path = f.name
-    try:
-        result = edit_file(
-            path=path,
-            old_string="    x = 1",
-            new_string="    x = 1\n    y = 2"  # Correct indent already
-        )
-        content = Path(path).read_text()
-        if "    y = 2" in content and "        y = 2" not in content:
-            r.ok("edit_file_preserves_correct_indentation")
-        else:
-            r.fail("edit_file_preserves_correct_indentation",
-                   f"Indentation was incorrectly modified: {content}")
-    finally:
-        os.unlink(path)
-
-
-def test_edit_file_finds_line_without_indentation(r: TestResults):
-    """edit_file should find lines even when old_string lacks indentation."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write("def foo():\n    x = 1\n    return x\n")
-        path = f.name
-    try:
-        # LLM provides old_string without indentation
-        result = edit_file(
-            path=path,
-            old_string="x = 1",  # Missing the 4-space indent
-            new_string="x = 2"
-        )
-        content = Path(path).read_text()
-        if "    x = 2" in content and "Error" not in result:
-            r.ok("edit_file_finds_line_without_indentation")
-        else:
-            r.fail("edit_file_finds_line_without_indentation",
-                   f"Should find and fix indentation. Result: {result}, Content: {content}")
-    finally:
-        os.unlink(path)
-
-
-def test_edit_file_replaces_first_occurrence(r: TestResults):
-    """edit_file should replace only the first occurrence when multiple matches exist."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write("if not running:\n    break\nprint('middle')\nif not running:\n    break\n")
-        path = f.name
-    try:
-        result = edit_file(
-            path=path,
-            old_string="if not running:\n    break",
-            new_string="if not running:\n    exit()"
-        )
-        content = Path(path).read_text()
-        # First occurrence should be replaced, second should remain unchanged
-        if "exit()" in content and content.count("break") == 1 and "first of" in result:
-            r.ok("edit_file_replaces_first_occurrence")
-        else:
-            r.fail("edit_file_replaces_first_occurrence", f"Got: {content}, Result: {result}")
-    finally:
-        os.unlink(path)
-
-
-def test_edit_file_multiline_indentation_agnostic(r: TestResults):
-    """edit_file should find multi-line blocks with different indentation."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write("def main():\n    for a in asteroids:\n        a.update()\n    return\n")
-        path = f.name
-    try:
-        # LLM sends without indentation
-        result = edit_file(
-            path=path,
-            old_string="for a in asteroids:\n    a.update()",
-            new_string="for a in asteroids:\n    a.update()\n    a.draw()"
-        )
-        content = Path(path).read_text()
-        if "        a.draw()" in content and "Error" not in result:
-            r.ok("edit_file_multiline_indentation_agnostic")
-        else:
-            r.fail("edit_file_multiline_indentation_agnostic", f"Got: {content}, Result: {result}")
-    finally:
-        os.unlink(path)
-
-
-def test_edit_file_tabs_vs_spaces(r: TestResults):
-    """edit_file should match tabs when old_string has spaces."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write("def foo():\n\tx = 1\n")  # File has tabs
-        path = f.name
-    try:
-        result = edit_file(
-            path=path,
-            old_string="    x = 1",  # LLM sends spaces (4 spaces = 1 tab)
-            new_string="    x = 2"
-        )
-        content = Path(path).read_text()
-        # Should find and edit the tab-indented line
-        if "x = 2" in content and "Error" not in result:
-            r.ok("edit_file_tabs_vs_spaces")
-        else:
-            r.fail("edit_file_tabs_vs_spaces", f"Got: {content}, result: {result}")
-    finally:
-        os.unlink(path)
-
-
-def test_edit_file_smart_quotes(r: TestResults):
-    """edit_file should handle smart quotes in search."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write('x = "hello"\n')  # ASCII quotes
-        path = f.name
-    try:
-        result = edit_file(
-            path=path,
-            old_string='x = \u201chello\u201d',  # Smart quotes (curly)
-            new_string='x = "world"'
-        )
-        content = Path(path).read_text()
-        if 'x = "world"' in content and "Error" not in result:
-            r.ok("edit_file_smart_quotes")
-        else:
-            r.fail("edit_file_smart_quotes", f"Got: {content}, result: {result}")
-    finally:
-        os.unlink(path)
-
-
-def test_edit_file_crlf(r: TestResults):
-    """edit_file should handle CRLF line endings."""
-    with tempfile.NamedTemporaryFile(mode='wb', suffix='.py', delete=False) as f:
-        f.write(b"x = 1\r\ny = 2\r\n")  # CRLF
-        path = f.name
-    try:
-        result = edit_file(
-            path=path,
-            old_string="x = 1\ny = 2",  # LF
-            new_string="x = 10\ny = 20"
-        )
-        content = Path(path).read_text()
-        if "x = 10" in content and "y = 20" in content and "Error" not in result:
-            r.ok("edit_file_crlf")
-        else:
-            r.fail("edit_file_crlf", f"Got: {content}, result: {result}")
-    finally:
-        os.unlink(path)
-
-
-def test_edit_file_fuzzy_shows_diff(r: TestResults):
-    """edit_file should show what differs for near-matches."""
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-        f.write("process_data(input_value)\n")
-        path = f.name
-    try:
-        result = edit_file(
-            path=path,
-            old_string="process_data(input_valeu)",  # Typo: valeu instead of value
-            new_string="transform_data(input_value)"
-        )
-        # Should NOT silently succeed - should show the difference
-        if "Error" in result and "similar" in result.lower():
-            r.ok("edit_file_fuzzy_shows_diff")
-        else:
-            r.fail("edit_file_fuzzy_shows_diff", f"Should show diff, got: {result}")
-    finally:
-        os.unlink(path)
-
-
 def run_all_tests() -> TestResults:
     """Run all tests and return results."""
     r = TestResults()
@@ -462,10 +274,6 @@ def run_all_tests() -> TestResults:
     test_edit_file_missing_old_string(r)
     test_edit_file_missing_new_string(r)
     test_edit_file_identical_strings(r)
-    test_edit_file_multiline_indentation_fix(r)
-    test_edit_file_preserves_correct_indentation(r)
-    test_edit_file_finds_line_without_indentation(r)
-    test_edit_file_replaces_first_occurrence(r)
     test_bash_missing_command(r)
     test_bash_cmd_alias(r)
     test_bash_string_timeout(r)
@@ -487,13 +295,6 @@ def run_all_tests() -> TestResults:
     # Question detection tests
     test_looks_like_question_true(r)
     test_looks_like_question_false(r)
-
-    # Fuzzy matching tests
-    test_edit_file_multiline_indentation_agnostic(r)
-    test_edit_file_tabs_vs_spaces(r)
-    test_edit_file_smart_quotes(r)
-    test_edit_file_crlf(r)
-    test_edit_file_fuzzy_shows_diff(r)
 
     return r
 
