@@ -77,6 +77,19 @@ def write_file(path: str = None, content: str = None) -> str:
     except Exception as e:
         return f"Error writing file: {e}"
 
+def _clean_string(s: str) -> str:
+    """Clean string by removing line number prefixes and trailing whitespace."""
+    import re
+    lines = s.split('\n')
+    cleaned = []
+    for line in lines:
+        # Remove line number prefix (e.g., "123\t" or "  45\t")
+        line = re.sub(r'^\s*\d+\t', '', line)
+        # Strip trailing whitespace
+        line = line.rstrip()
+        cleaned.append(line)
+    return '\n'.join(cleaned)
+
 def edit_file(path: str = None, old_string: str = None, new_string: str = None, replace_all: bool = False) -> str:
     """Replace old_string with new_string in file."""
     try:
@@ -96,8 +109,28 @@ def edit_file(path: str = None, old_string: str = None, new_string: str = None, 
         content = p.read_text()
         count = content.count(old_string)
 
+        # If not found, try with cleaned strings (no line numbers, no trailing whitespace)
         if count == 0:
-            return f"Error: String not found in file"
+            cleaned_old = _clean_string(old_string)
+            cleaned_new = _clean_string(new_string)
+            # Normalize file content too (strip trailing whitespace per line)
+            content_normalized = '\n'.join(line.rstrip() for line in content.split('\n'))
+            count = content_normalized.count(cleaned_old)
+            if count > 0:
+                # Use cleaned versions
+                old_string = cleaned_old
+                new_string = cleaned_new
+                content = content_normalized
+
+        if count == 0:
+            # Show first line and try to find similar content
+            first_line = old_string.split('\n')[0]
+            # Search for similar line in file (strip whitespace for comparison)
+            search_stripped = first_line.strip()
+            for i, file_line in enumerate(content.splitlines(), 1):
+                if search_stripped and search_stripped in file_line:
+                    return f"Error: String not found in {path}.\nLooking for: {first_line[:60]!r}\nSimilar at line {i}: {file_line[:60]!r}\nCheck indentation (tabs vs spaces)."
+            return f"Error: String not found in {path}. Looking for: {first_line[:80]!r}"
         if count > 1 and not replace_all:
             return f"Error: String found {count} times, must be unique. Use replace_all=true to replace all occurrences."
 
@@ -173,6 +206,50 @@ def glob_files(pattern: str = None, path: str = ".") -> str:
         return "\n".join(results)
     except Exception as e:
         return f"Error globbing: {e}"
+
+def grep(pattern: str = None, path: str = ".", include: str = None) -> str:
+    """Search for text pattern in files."""
+    try:
+        if not pattern:
+            return "Error: 'pattern' parameter is required"
+        import re
+        path = path.strip() if path else "."
+        base = Path(path).expanduser().resolve()
+
+        # Determine files to search
+        if base.is_file():
+            files = [base]
+        else:
+            # Search all text files, respecting excludes
+            glob_pattern = include if include else "**/*"
+            files = [f for f in base.glob(glob_pattern) if f.is_file()]
+            files = [f for f in files if not any(part in GLOB_EXCLUDES for part in f.relative_to(base).parts)]
+
+        results = []
+        try:
+            regex = re.compile(pattern)
+        except re.error:
+            # Treat as literal string if not valid regex
+            regex = re.compile(re.escape(pattern))
+
+        for f in files[:500]:  # Limit files searched
+            try:
+                content = f.read_text(errors='ignore')
+                for i, line in enumerate(content.splitlines(), 1):
+                    if regex.search(line):
+                        rel_path = f.relative_to(base) if base.is_dir() else f.name
+                        results.append(f"{rel_path}:{i}: {line[:200]}")
+                        if len(results) >= 50:  # Limit results
+                            results.append("... (truncated)")
+                            return "\n".join(results)
+            except:
+                continue
+
+        if not results:
+            return f"No matches for '{pattern}'"
+        return "\n".join(results)
+    except Exception as e:
+        return f"Error searching: {e}"
 
 # Tool registry with schemas for Ollama
 TOOLS = {
@@ -257,12 +334,31 @@ TOOLS = {
             "type": "function",
             "function": {
                 "name": "glob",
-                "description": "Find files matching a pattern",
+                "description": "Find files by filename pattern (e.g. **/*.py). Does NOT search file contents - use grep for that.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "pattern": {"type": "string", "description": "Glob pattern (e.g. **/*.py)"},
                         "path": {"type": "string", "description": "Base directory (default .)"}
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }
+    },
+    "grep": {
+        "fn": grep,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "grep",
+                "description": "Search for text pattern inside files. Returns matching lines with file:line: prefix.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "Text or regex pattern to search for"},
+                        "path": {"type": "string", "description": "File or directory to search (default .)"},
+                        "include": {"type": "string", "description": "Glob pattern to filter files (e.g. **/*.py)"}
                     },
                     "required": ["pattern"]
                 }
@@ -298,7 +394,8 @@ def validate_tool_call(name: str, args: dict) -> Optional[str]:
                 content = p.read_text()
                 count = content.count(old_string)
                 if count == 0:
-                    return "String not found in file"
+                    first_line = old_string.split('\n')[0][:80]
+                    return f"String not found in {path}. Looking for: {first_line!r}"
                 if count > 1 and not replace_all:
                     return f"String found {count} times, must be unique. Use replace_all=true to replace all."
             except Exception as e:

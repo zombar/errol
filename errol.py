@@ -271,9 +271,10 @@ Current working directory: {cwd}
 - write_file(path, content): Create or overwrite files
 - edit_file(path, old_string, new_string, replace_all=false): Find/replace string in file
 - bash(command, timeout): Run shell commands
-- glob(pattern, path): Find files by pattern
+- glob(pattern, path): Find files by filename pattern (e.g. **/*.py)
+- grep(pattern, path, include): Search for text inside files
 
-IMPORTANT: These are the ONLY tools. Do not try "search", "grep", "container.exec", "repo_browser", or any other tool names.
+IMPORTANT: These are the ONLY tools. Do not try "search", "container.exec", "repo_browser", or any other tool names.
 
 ## CRITICAL: Stay On Task
 - Your ONLY job is to answer/complete what the user asked
