@@ -9,7 +9,6 @@ A minimal, self-modifying local LLM agent using Ollama.
 pip install -r requirements.txt
 
 # Pull Ollama models
-# The project now uses the gpt-oss:20b model for all tiers
 ollama pull gpt-oss:20b
 
 # Start Ollama
@@ -60,13 +59,18 @@ errol self-check
 
 ## Self-Modification
 
-Errol knows its own source location and can modify itself:
+Errol can modify itself, but you'll need to restart the app to see any new functionality:
 
 ```bash
 errol chat "add a new tool called 'search_code' to tools.py"
 ```
 
 All file changes show a git‑style diff and require confirmation before applying.
+
+You can run builtin tests:
+```bash
+errol self-check
+```
 
 ## Configuration
 
