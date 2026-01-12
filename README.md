@@ -1,6 +1,6 @@
 # Errol
 
-A minimal, self-modifying MoE (Mixture of Experts) local LLM agent using Ollama.
+A minimal, self-modifying local LLM agent using Ollama.
 
 ## Setup
 
@@ -36,20 +36,12 @@ Replace `/path/to/errol` with the actual path to the errol directory.
 ## Usage
 
 ```bash
-# Interactive chat
-errol chat
+# Interactive mode (default)
+errol
 
 # Single task
 errol chat "read errol.py and explain it"
 errol chat "add a --verbose flag to the chat command"
-
-# Todos
-errol todo add "implement caching"
-errol todo list
-errol todo start <id>
-errol todo done <id>
-errol todo rm <id>
-errol todo clear
 
 # Check available models
 errol models
@@ -62,7 +54,7 @@ errol self-check
 
 | Tier   | Model              | Use Case                           |
 |--------|--------------------|------------------------------------|
-| Small  | gpt-oss:20b        | Routing, todos, file reads         |
+| Small  | gpt-oss:20b        | Routing, file reads                |
 | Medium | gpt-oss:20b        | Explanations, small edits          |
 | Large  | gpt-oss:20b        | Code generation, refactors         |
 
