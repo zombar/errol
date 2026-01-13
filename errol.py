@@ -34,8 +34,11 @@ RL_END = "\002"    # End of non-printing sequence
 
 # Read-only tools that auto-execute after countdown
 READONLY_TOOLS = ("read_file", "glob", "grep", "todo")
-from tools import execute_tool, get_tool_schemas, validate_tool_call, TOOLS
+from tools import execute_tool, get_tool_schemas, validate_tool_call, resolve_tool_name, TOOLS
 from task_tracker import get_tracker, reset_tracker
+
+# Store last raw LLM response for 'raw' command
+_last_raw_response = {"content": "", "reasoning": ""}
 
 
 def looks_like_question(text: str) -> bool:
@@ -140,6 +143,40 @@ def looks_like_code_suggestion(text: str) -> bool:
     return False
 
 
+def looks_like_multi_step_plan(text: str) -> bool:
+    """Detect if the model outlined a multi-step plan (not just a single change)."""
+    if not text:
+        return False
+
+    import re
+
+    # Count numbered steps (1. 2. 3. or 1) 2) 3))
+    numbered_pattern = r'^\s*\d+[\.\)]\s+\S'
+    numbered_matches = re.findall(numbered_pattern, text, re.MULTILINE)
+    if len(numbered_matches) >= 3:
+        return True
+
+    # Count bullet points
+    bullet_pattern = r'^\s*[-•*]\s+\S'
+    bullet_matches = re.findall(bullet_pattern, text, re.MULTILINE)
+    if len(bullet_matches) >= 4:
+        return True
+
+    # Multiple "step" or "change" mentions
+    text_lower = text.lower()
+    step_words = ['step 1', 'step 2', 'change 1', 'change 2', 'first,', 'second,', 'third,']
+    step_count = sum(1 for word in step_words if word in text_lower)
+    if step_count >= 2:
+        return True
+
+    # Multiple code blocks (suggests multiple changes)
+    code_blocks = text.count('```')
+    if code_blocks >= 4:  # 2+ complete blocks (open + close each)
+        return True
+
+    return False
+
+
 def extract_reasoning_level(task: str) -> tuple[str, str]:
     """Extract reasoning level prefix from task. Returns (level, cleaned_task).
 
@@ -188,32 +225,155 @@ def extract_json_objects(text: str) -> list[str]:
     return objects
 
 
+def parse_python_tool_call(text: str) -> list[dict]:
+    """Parse Python-style tool calls like todo(action='add', content='...')."""
+    import ast
+
+    results = []
+    tool_names = ['todo', 'glob', 'grep', 'read_file', 'edit_file', 'write_file', 'bash']
+
+    for tool_name in tool_names:
+        # Find all occurrences of tool_name( and extract balanced parentheses
+        start = 0
+        while True:
+            # Find tool call start
+            pattern = rf'\b{tool_name}\s*\('
+            match = re.search(pattern, text[start:])
+            if not match:
+                break
+
+            call_start = start + match.end()  # Position after opening (
+            # Find matching closing )
+            depth = 1
+            i = call_start
+            while i < len(text) and depth > 0:
+                if text[i] == '(':
+                    depth += 1
+                elif text[i] == ')':
+                    depth -= 1
+                i += 1
+
+            if depth == 0:
+                args_str = text[call_start:i-1]
+
+                # Parse the arguments
+                args = {}
+                try:
+                    # Try to parse as Python dict literal
+                    dict_str = '{' + args_str + '}'
+                    parsed = ast.literal_eval(dict_str)
+                    if isinstance(parsed, dict):
+                        args = parsed
+                except:
+                    # Fallback: manual parsing for key='value' patterns
+                    for part in re.finditer(r"(\w+)\s*=\s*['\"](.+?)['\"]", args_str, re.DOTALL):
+                        key, value = part.groups()
+                        # Clean up the value
+                        value = value.strip().replace('\n', ' ').replace('  ', ' ')
+                        args[key] = value
+
+                # Map common aliases
+                if 'description' in args and 'content' not in args:
+                    args['content'] = args.pop('description')
+
+                if args:
+                    results.append({
+                        "function": {
+                            "name": tool_name,
+                            "arguments": args
+                        }
+                    })
+
+            start = call_start
+
+    return results
+
+def infer_tool_from_args(obj: dict):
+    """Infer tool name from argument structure when name is missing."""
+    # edit_file: has path, old_string, new_string
+    if "path" in obj and "old_string" in obj and "new_string" in obj:
+        return "edit_file", obj
+    # write_file: has path and content
+    if "path" in obj and "content" in obj and "old_string" not in obj:
+        return "write_file", obj
+    # read_file: has path only (or with offset/limit)
+    if "path" in obj and len(obj) <= 3 and all(k in ["path", "offset", "limit"] for k in obj):
+        return "read_file", obj
+    # grep: has pattern
+    if "pattern" in obj and "old_string" not in obj:
+        return "grep", obj
+    # glob: has pattern but different context
+    if "pattern" in obj and "path" in obj and len(obj) == 2:
+        return "glob", obj
+    # todo: has action
+    if "action" in obj:
+        return "todo", obj
+    # bash: has command
+    if "command" in obj:
+        return "bash", obj
+    return None
+
 def parse_tool_calls_from_text(text: str) -> list[dict]:
-    """Extract first valid tool call from JSON in text (fallback for models without native tool support)."""
-    # Extract all JSON objects from text
+    """Extract tool calls from text (fallback for models without native tool support)."""
+    # First try Python-style calls: todo(action='add', ...)
+    python_calls = parse_python_tool_call(text)
+    if python_calls:
+        return python_calls
+
+    # Then try JSON format
     candidates = extract_json_objects(text)
+    results = []
+
+    # Valid tool names are alphanumeric with underscores only
+    def is_valid_tool_name(name: str) -> bool:
+        if not name or not isinstance(name, str):
+            return False
+        # Reject names with special characters (channel markers, placeholders, etc.)
+        if any(c in name for c in '<>|'):
+            return False
+        # Must be a reasonable identifier
+        return all(c.isalnum() or c == '_' for c in name)
 
     for match in candidates:
         try:
             obj = json.loads(match)
-            # Accept both "arguments" and "parameters" keys
-            args = obj.get("arguments") or obj.get("parameters")
-            if "name" in obj and args:
-                # Skip if arguments contain placeholders
+
+            # Check for explicit name field
+            if "name" in obj:
+                name = obj["name"]
+                if not is_valid_tool_name(name):
+                    continue  # Skip invalid tool names
+                args = obj.get("arguments") or obj.get("parameters")
+                if args:
+                    args_str = json.dumps(args)
+                    if '<' in args_str and '>' in args_str:
+                        continue
+                    results.append({
+                        "function": {
+                            "name": name,
+                            "arguments": args
+                        }
+                    })
+                    continue
+
+            # Try to infer tool from argument structure
+            inferred = infer_tool_from_args(obj)
+            if inferred:
+                tool_name, args = inferred
                 args_str = json.dumps(args)
                 if '<' in args_str and '>' in args_str:
                     continue
-                # Return first valid tool call only
-                return [{
+                results.append({
                     "function": {
-                        "name": obj["name"],
+                        "name": tool_name,
                         "arguments": args
                     }
-                }]
+                })
+
         except json.JSONDecodeError:
             continue
 
-    return []
+    return results
 
 app = typer.Typer(
     name="errol",
@@ -251,6 +411,92 @@ def interactive_input(prompt: str, prefill: str = "") -> str:
         readline.set_startup_hook()
 
 
+def check_existing_session() -> bool:
+    """Check for existing session and prompt user."""
+    session_path = Path(".errol") / "last_session.json"
+    plan_path = Path(".errol/PLAN.md")
+
+    if not session_path.exists() and not plan_path.exists():
+        return False  # No existing session
+
+    # Show current plan if exists
+    if plan_path.exists():
+        content = plan_path.read_text()
+        print(f"\n{CYAN}◆ Found existing plan:{RESET}")
+        preview = content[:500] + "..." if len(content) > 500 else content
+        print(f"{DIM}{preview}{RESET}")
+
+    try:
+        response = input(f"\n{YELLOW}Continue previous session?{RESET} [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        response = "n"
+
+    if response in ("y", "yes"):
+        return True  # Will load session
+    else:
+        # Clear both session and plan
+        if session_path.exists():
+            session_path.unlink()
+        if plan_path.exists():
+            plan_path.unlink()
+        print(f"{DIM}Session cleared.{RESET}")
+        return False
+
+
+def clear_saved_session():
+    """Delete any saved session state."""
+    session_path = Path(".errol") / "last_session.json"
+    plan_path = Path(".errol/PLAN.md")
+    if session_path.exists():
+        session_path.unlink()
+    if plan_path.exists():
+        plan_path.unlink()
+
+
+def show_tasks():
+    """Display current tasks in TODO format with subtask indentation."""
+    tracker = get_tracker()
+
+    # Try loading saved session if no current tasks
+    if not tracker.has_tasks():
+        tracker.load()
+
+    if not tracker.has_tasks():
+        print(f"{DIM}No tasks.{RESET}")
+        return
+
+    print(f"\n{CYAN}Tasks:{RESET}")
+    for task in tracker.list():
+        if task["status"] == "completed":
+            marker = f"{GREEN}✓{RESET}"
+        elif task["status"] == "in_progress":
+            marker = f"{YELLOW}→{RESET}"
+        else:
+            marker = f"{DIM}○{RESET}"
+
+        # Indent subtasks
+        indent = "    " if task.get("parent_id") else "  "
+        print(f"{indent}{marker} [{task['id']}] {task['content']}")
+
+
+def delete_task(task_id: str):
+    """Delete a task by ID."""
+    tracker = get_tracker()
+
+    # Load saved session if needed
+    if not tracker.has_tasks():
+        tracker.load()
+
+    task = tracker.get(task_id)
+    if not task:
+        print(f"{RED}✗ Task '{task_id}' not found.{RESET}")
+        return
+
+    tracker.remove(task_id)
+    tracker.save()  # Persist the change
+    print(f"{GREEN}✓ Deleted task: {task['content'][:50]}{RESET}")
+
+
 @app.callback()
 def main(ctx: typer.Context):
     """Errol - local LLM coding agent. Run without arguments for interactive mode."""
@@ -263,7 +509,13 @@ def main(ctx: typer.Context):
         prefill = ""
 
         print(f"\n{MAGENTA}▶ errol{RESET} {DIM}interactive mode{RESET}")
-        print(f"{DIM}↑/↓ history, ←/→ cursor, 'quit' to exit{RESET}\n")
+        print(f"{DIM}↑/↓ history, 'raw' for LLM output, 'quit' to exit{RESET}\n")
+
+        # Check for existing session on startup
+        if check_existing_session():
+            tracker = get_tracker()
+            tracker.load()
+            print(f"{GREEN}✓ Session restored. Type 'tasks' to see progress.{RESET}\n")
 
         while True:
             try:
@@ -272,9 +524,70 @@ def main(ctx: typer.Context):
 
                 if not task:
                     continue
-                if task.lower() in ("quit", "exit", "q"):
+
+                task_lower = task.lower()
+
+                if task_lower in ("quit", "exit", "q"):
                     print(f"{DIM}Bye!{RESET}")
                     break
+
+                # Handle special commands
+                if task_lower == "continue":
+                    tracker = get_tracker()
+                    if not tracker.load() or not tracker.interrupted:
+                        print(f"{YELLOW}No interrupted session to continue.{RESET}")
+                        continue
+                    # Resume with the original task
+                    original_task = tracker.original_task
+                    print(f"{GREEN}✓ Resuming: {original_task[:50]}...{RESET}")
+                    readline.add_history("continue")
+                    cancelled = agent_loop(original_task, config, resume=True)
+                    if cancelled:
+                        prefill = "continue"
+                    print()
+                    continue
+
+                elif task_lower == "clear":
+                    clear_saved_session()
+                    reset_tracker()
+                    print(f"{GREEN}✓ Session cleared.{RESET}")
+                    continue
+
+                elif task_lower in ("tasks", "todo"):
+                    show_tasks()
+                    continue
+
+                elif task_lower == "raw":
+                    show_raw_feedback()
+                    continue
+
+                elif task_lower.startswith("delete "):
+                    task_id = task.split(" ", 1)[1].strip()
+                    delete_task(task_id)
+                    continue
+
+                elif task_lower == "approve":
+                    tracker = get_tracker()
+                    if tracker.mode == "planning":
+                        tracker.mode = "write"
+                        tracker.save()
+                        print(f"{GREEN}✓ Plan approved. Switching to write mode.{RESET}")
+                        # Automatically continue with the saved task
+                        if tracker.original_task:
+                            print(f"{DIM}Executing plan...{RESET}")
+                            cancelled = agent_loop(tracker.original_task, config, resume=True)
+                            if cancelled:
+                                continue
+                    else:
+                        print(f"{YELLOW}Already in write mode.{RESET}")
+                    continue
+
+                elif task_lower == "plan":
+                    tracker = get_tracker()
+                    tracker.mode = "planning"
+                    tracker.save()
+                    print(f"{CYAN}◆ Entering planning mode. Read-only operations only.{RESET}")
+                    continue
 
                 # Add to readline history
                 readline.add_history(task)
@@ -342,8 +655,16 @@ Current working directory: {cwd}
 {{"name": "bash", "parameters": {{"command": "string", "timeout": "int (optional)"}}}}
 {{"name": "glob", "parameters": {{"pattern": "string", "path": "string (optional)"}}}}
 {{"name": "grep", "parameters": {{"pattern": "string", "path": "string (optional)"}}}}
+{{"name": "todo", "parameters": {{"action": "list|add|start|complete", "content": "string (for add)", "task_id": "string (for start/complete)", "parent_id": "string (for subtasks)", "file_path": "string (optional)", "anchor": "string (optional, function/class name)"}}}}
 
-IMPORTANT: These are the ONLY 6 tools. Do not try "search", "container.exec", "repo_browser", or any other names.
+IMPORTANT: These are the ONLY 7 tools. Do not try "search", "container.exec", "repo_browser", or any other names.
+
+## Multi-Step Tasks
+When a task requires multiple changes (e.g. "add feature X" requiring class + usage + tests):
+1. FIRST call todo with action="add" for each step you plan to take
+2. Before starting each step, call todo with action="start" and the task_id
+3. After completing each step, call todo with action="complete" and the task_id
+This ensures you complete ALL planned changes, not just the first one.
 
 ## CRITICAL: Stay On Task
 - Your ONLY job is to answer/complete what the user asked
@@ -357,6 +678,36 @@ IMPORTANT: These are the ONLY 6 tools. Do not try "search", "container.exec", "r
 
 ## Completion Requirement:
 After gathering information, you MUST directly address the user's original request.
+"""
+
+# Separate, focused prompt for planning mode - only includes read-only tools
+PLANNING_PROMPT = """You are Errol in PLANNING MODE. Your ONLY job is to create a structured plan.
+
+Current working directory: {cwd}
+
+## Available Tools (ONLY these 4):
+
+{{"name": "glob", "parameters": {{"pattern": "string", "path": "string (optional)"}}}}
+{{"name": "grep", "parameters": {{"pattern": "string", "path": "string (optional)"}}}}
+{{"name": "read_file", "parameters": {{"path": "string", "offset": "int (optional)", "limit": "int (optional)"}}}}
+{{"name": "todo", "parameters": {{"action": "add", "content": "string", "parent_id": "{root_id}", "file_path": "string", "anchor": "string"}}}}
+
+## Your Task:
+1. Use glob/grep/read_file to understand the codebase
+2. Create a todo for EACH implementation step using: todo(action="add", content="...", parent_id="{root_id}", file_path="...", anchor="...")
+3. Stop after creating todos - do NOT write code or suggest implementations
+
+## CRITICAL RULES:
+- Do NOT output code blocks or patches
+- Do NOT describe what code should look like
+- ONLY call tools - create todos for each step
+- Each todo must have file_path (the file to modify) and anchor (function/class name)
+
+## Example:
+User: "Add a save feature"
+You: 1. glob to find relevant files, 2. read_file to understand structure, 3. todo(action="add", content="Add save() method to Game class", file_path="game.py", anchor="class Game", parent_id="{root_id}")
+
+After creating ALL todos, say "Plan complete. Type 'approve' to execute."
 """
 
 def load_config() -> dict:
@@ -423,6 +774,54 @@ def preview_file_change(name: str, args: dict) -> str:
 
     return ""
 
+def show_raw_feedback():
+    """Display stored raw LLM feedback."""
+    global _last_raw_response
+    raw_content = _last_raw_response.get("content", "")
+    reasoning = _last_raw_response.get("reasoning", "")
+    tool_calls = _last_raw_response.get("tool_calls", [])
+
+    if not raw_content and not reasoning and not tool_calls:
+        print(f"{YELLOW}No raw response stored.{RESET}")
+        return
+
+    print(f"\n{DIM}{'─'*60}{RESET}")
+    print(f"{CYAN}▼ Raw LLM Feedback{RESET}")
+    print(f"{DIM}{'─'*60}{RESET}")
+
+    if reasoning:
+        print(f"{YELLOW}reasoning:{RESET}")
+        for line in reasoning.split('\n'):
+            print(f"  {DIM}{line}{RESET}")
+        print()
+
+    if raw_content:
+        print(f"{YELLOW}content:{RESET}")
+        for line in raw_content.split('\n'):
+            print(f"  {DIM}{line}{RESET}")
+        print()
+
+    if tool_calls:
+        print(f"{YELLOW}tool_calls:{RESET}")
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            name = fn.get("name", "unknown")
+            args = fn.get("arguments", {})
+            print(f"  {DIM}{name}({json.dumps(args, indent=4)}){RESET}")
+
+    print(f"{DIM}{'─'*60}{RESET}")
+
+
+def store_raw_response(raw_content: str, reasoning: str, tool_calls: list = None):
+    """Store raw LLM response for later viewing with 'raw' command."""
+    global _last_raw_response
+    _last_raw_response = {
+        "content": raw_content,
+        "reasoning": reasoning,
+        "tool_calls": tool_calls or []
+    }
+
+
 def countdown_confirm(seconds: int = 3) -> bool:
     """Auto-confirm after countdown, allow 'n' to cancel."""
     import termios
@@ -482,11 +881,34 @@ def confirm_tool(name: str, args: dict) -> bool:
 
     return confirm in ("y", "yes")
 
-def agent_loop(task: str, config: dict) -> bool:
+def show_plan_summary(tracker) -> bool:
+    """Show plan summary if subtasks exist. Returns True if plan is complete."""
+    subtasks = [t for t in tracker.tasks if t.get("parent_id")]
+    if not subtasks:
+        return False
+
+    print(f"\n{GREEN}✓ Plan created with {len(subtasks)} steps:{RESET}")
+    for i, task in enumerate(subtasks, 1):
+        location = ""
+        if task.get("file_path") or task.get("anchor"):
+            parts = []
+            if task.get("file_path"):
+                parts.append(task["file_path"])
+            if task.get("anchor"):
+                parts.append(task["anchor"])
+            location = f" {DIM}@ {':'.join(parts)}{RESET}"
+        print(f"  {i}. {task['content']}{location}")
+    print(f"\n{DIM}Type 'approve' to execute the plan.{RESET}")
+    return True
+
+def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
     """Main agent execution loop. Returns True if cancelled by ESC."""
-    # Reset task tracker for this session
-    reset_tracker()
     tracker = get_tracker()
+
+    # Only reset if not resuming a previous session
+    if not resume and not tracker.has_tasks():
+        reset_tracker()
+        tracker = get_tracker()
 
     client = OllamaClient(
         host=config["ollama"]["host"],
@@ -508,17 +930,40 @@ def agent_loop(task: str, config: dict) -> bool:
         return False
 
     print(f"\n{MAGENTA}▶ errol{RESET} {DIM}using {model}{RESET}")
+    if tracker.mode == "planning":
+        print(f"{CYAN}◆ Planning mode{RESET} {DIM}(read-only, type 'approve' to execute){RESET}")
 
     # Extract reasoning level from task (ultrathink:, quick:, etc.)
     reasoning_level, clean_task = extract_reasoning_level(task)
 
-    # Build system prompt with reasoning level
-    system = SYSTEM_PROMPT.format(cwd=os.getcwd(), reasoning_level=reasoning_level)
+    # Create root task if starting fresh
+    root_id = None
+    if not resume:
+        root_id = tracker.add(clean_task, f"Working on: {clean_task[:50]}...")
+        tracker.set_status(root_id, "in_progress")
+        tracker.original_task = clean_task
+        tracker.interrupted = False
+    else:
+        # Find root task ID from existing tasks
+        for t in tracker.tasks:
+            if not t.get("parent_id"):
+                root_id = t["id"]
+                break
 
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": clean_task}
-    ]
+    # Build system prompt - use focused PLANNING_PROMPT in planning mode
+    if tracker.mode == "planning":
+        system = PLANNING_PROMPT.format(cwd=os.getcwd(), root_id=root_id)
+    else:
+        system = SYSTEM_PROMPT.format(cwd=os.getcwd(), reasoning_level=reasoning_level)
+
+    # Use restored messages if resuming, otherwise start fresh
+    if resume and tracker.messages:
+        messages = tracker.messages
+    else:
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": clean_task}
+        ]
 
     tools = get_tool_schemas()
     max_turns = config["agent"]["max_turns"]
@@ -537,7 +982,11 @@ def agent_loop(task: str, config: dict) -> bool:
             response = client.chat_sync(model, messages, tools=tools)
         except KeyboardInterrupt:
             timer.stop()
-            print(f"\n{YELLOW}⚠ Interrupted{RESET}")
+            # Save state for continuation
+            tracker.messages = messages
+            tracker.interrupted = True
+            tracker.save()
+            print(f"\n{YELLOW}⚠ Interrupted - state saved. Type 'continue' to resume.{RESET}")
             return True  # Signal cancellation
         except Exception as e:
             # If Ollama fails to parse tool calls, retry without tools
@@ -548,7 +997,11 @@ def agent_loop(task: str, config: dict) -> bool:
                     response = client.chat_sync(model, messages, tools=None)
                 except KeyboardInterrupt:
                     timer.stop()
-                    print(f"\n{YELLOW}⚠ Interrupted{RESET}")
+                    # Save state for continuation
+                    tracker.messages = messages
+                    tracker.interrupted = True
+                    tracker.save()
+                    print(f"\n{YELLOW}⚠ Interrupted - state saved. Type 'continue' to resume.{RESET}")
                     return True
                 except Exception as e2:
                     timer.stop()
@@ -563,6 +1016,7 @@ def agent_loop(task: str, config: dict) -> bool:
 
         msg = response.get("message", {})
         full_content = msg.get("content", "")
+        reasoning = msg.get("reasoning_content", "")
         tool_calls = msg.get("tool_calls", [])
 
         # Fallback: parse tool calls from text if model doesn't use native format
@@ -570,10 +1024,11 @@ def agent_loop(task: str, config: dict) -> bool:
             tool_calls = parse_tool_calls_from_text(full_content)
 
         # Fallback: gpt-oss sometimes puts tool calls in reasoning_content
-        if not tool_calls:
-            reasoning = msg.get("reasoning_content", "")
-            if reasoning:
-                tool_calls = parse_tool_calls_from_text(reasoning)
+        if not tool_calls and reasoning:
+            tool_calls = parse_tool_calls_from_text(reasoning)
+
+        # Store raw response for 'raw' command (always, even if only tool calls)
+        store_raw_response(full_content, reasoning, tool_calls)
 
         if full_content:
             # Clean up escaped newlines and format output
@@ -601,8 +1056,12 @@ def agent_loop(task: str, config: dict) -> bool:
         if tool_calls:
             for tc in tool_calls:
                 fn = tc.get("function", {})
-                name = fn.get("name", "")
+                original_name = fn.get("name", "")
                 args = fn.get("arguments", {})
+
+                # Skip invalid tool names (channel markers, garbage, etc.)
+                if not original_name or any(c in original_name for c in '<>|'):
+                    continue
 
                 # Parse args if string
                 if isinstance(args, str):
@@ -610,6 +1069,20 @@ def agent_loop(task: str, config: dict) -> bool:
                         args = json.loads(args)
                     except:
                         args = {}
+
+                # Resolve tool name (alias or fuzzy match) for consistent checks
+                name, _ = resolve_tool_name(original_name)
+
+                # Enforce planning mode - block write operations
+                if tracker.mode == "planning" and name in ("edit_file", "write_file", "bash"):
+                    print(f"\n{DIM}{'─'*60}{RESET}")
+                    print(f"{CYAN}◆{RESET} {name}")
+                    print(f"{DIM}{'─'*60}{RESET}")
+                    print(f"{YELLOW}⚠ Planning mode - cannot modify files.{RESET}")
+                    print(f"{DIM}Type 'approve' to switch to write mode.{RESET}")
+                    result = "Error: Cannot modify files in planning mode. User must type 'approve' to switch to write mode."
+                    messages.append({"role": "tool", "content": result})
+                    continue
 
                 # Validate before prompting
                 validation_error = validate_tool_call(name, args)
@@ -639,30 +1112,63 @@ def agent_loop(task: str, config: dict) -> bool:
                     "content": result
                 })
 
-                # Inject task context reminder if there are tracked tasks
-                if tracker.has_tasks() and name != "todo":
-                    task_context = tracker.to_prompt_context()
+                # Inject focused task reminder - tell LLM exactly what to do next
+                if tracker.has_tasks() and name != "todo" and tracker.mode == "write":
+                    # Find the next pending or in-progress subtask
+                    next_task = None
+                    for t in tracker.tasks:
+                        if t.get("parent_id") and t["status"] in ("pending", "in_progress"):
+                            next_task = t
+                            break
+                    if next_task:
+                        location = ""
+                        if next_task.get("file_path"):
+                            location = f" in {next_task['file_path']}"
+                            if next_task.get("anchor"):
+                                location += f" at {next_task['anchor']}"
+                        messages.append({
+                            "role": "user",
+                            "content": f"NEXT TASK: {next_task['content']}{location}\n\nUse edit_file to make this change now. Task ID: {next_task['id']}"
+                        })
+
+                if name == "read_file" and not result.startswith("Error") and tracker.mode == "planning":
                     messages.append({
                         "role": "user",
-                        "content": f"[Task Reminder]\n{task_context}\n\nContinue with the current task."
+                        "content": "Now create todos for each change needed. Use todo(action='add', ...) for each step."
                     })
 
-                # Boost reasoning after successful file read to help analyze content
-                if name == "read_file" and not result.startswith("Error"):
-                    messages.append({
-                        "role": "user",
-                        "content": "Reasoning: high\nAnalyze this file carefully and determine the exact change needed to complete the task."
-                    })
+            # After processing all tool calls, check if plan is complete
+            if tracker.mode == "planning" and show_plan_summary(tracker):
+                break
         else:
             # No tool calls - check if model described changes without using tools
             if looks_like_code_suggestion(full_content) and reprompt_count < max_reprompts:
                 reprompt_count += 1
-                print(f"{DIM}↻ prompting to use edit_file ({reprompt_count}/{max_reprompts})...{RESET}")
-                file_hint = f" The file you read was: {last_file_read}" if last_file_read else ""
-                messages.append({
-                    "role": "user",
-                    "content": f"You described a code change but did not call edit_file. Describing changes does NOT modify the file. You MUST call edit_file with path, old_string (exact text to replace), and new_string (replacement).{file_hint} Do it now."
-                })
+
+                # In planning mode: force todo creation, don't prompt for edits
+                if tracker.mode == "planning":
+                    if show_plan_summary(tracker):
+                        break
+                    # No subtasks yet - prompt to create them
+                    print(f"{DIM}↻ prompting to create todos (planning mode) ({reprompt_count}/{max_reprompts})...{RESET}")
+                    messages.append({
+                        "role": "user",
+                        "content": "You described changes but did NOT create todos. In planning mode you MUST call todo(action='add', content='...', file_path='...', anchor='...') for EACH step. Do NOT describe the plan in text - call the todo tool now for each step."
+                    })
+                # In write mode: prompt for edits or todo tracking
+                elif looks_like_multi_step_plan(full_content) and not tracker.has_tasks():
+                    print(f"{DIM}↻ prompting to create todos for multi-step plan ({reprompt_count}/{max_reprompts})...{RESET}")
+                    messages.append({
+                        "role": "user",
+                        "content": "You outlined multiple changes but did not track them. Before making edits, call the todo tool with action='add' for EACH step in your plan. This ensures you complete ALL changes, not just the first one. Create the todos now."
+                    })
+                else:
+                    print(f"{DIM}↻ prompting to use edit_file ({reprompt_count}/{max_reprompts})...{RESET}")
+                    file_hint = f" The file you read was: {last_file_read}" if last_file_read else ""
+                    messages.append({
+                        "role": "user",
+                        "content": f"You described a code change but did not call edit_file. Describing changes does NOT modify the file. You MUST call edit_file with path, old_string (exact text to replace), and new_string (replacement).{file_hint} Do it now."
+                    })
             # Check if model is asking a question
             elif looks_like_question(full_content) and reprompt_count < max_reprompts:
                 reprompt_count += 1
@@ -677,6 +1183,17 @@ def agent_loop(task: str, config: dict) -> bool:
 
     if turn >= max_turns - 1:
         print(f"\n{YELLOW}⚠ Reached max turns ({max_turns}){RESET}")
+        # Save state so user can continue
+        tracker.messages = messages
+        tracker.interrupted = True
+        tracker.save()
+        print(f"{DIM}State saved. Type 'continue' to resume.{RESET}")
+    else:
+        # Task completed normally - mark root task complete and clear session
+        for task in tracker.list():
+            if task.get("parent_id") is None and task["status"] == "in_progress":
+                tracker.set_status(task["id"], "completed")
+        clear_saved_session()
 
     return False
 

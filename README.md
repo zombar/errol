@@ -1,6 +1,18 @@
 # Errol
 
-A minimal, self-modifying local LLM agent using Ollama.
+A minimal, self-modifying local LLM agent using Ollama. 
+
+Errol is designed to iterate on it's own source code (you can use the `--self-check` switch to verify the app still works after changes)
+
+When using on new projects, it is recommended that you use git to ensure that bad changes can easily be reverted as the tool will make mistakes:
+```
+git init                         # Create the projects source control folders
+git add *.py                     # Add your changes to a commit
+git commit -m "wrapper script"   # Add the commit to git history
+
+git reset --hard HEAD~1          # Examples to rewind the latest change
+git revert HEAD 
+```
 
 This app is designed to be run on a mac (preferably M4/M5) using the binaries that come symlinked to `python3`.
 
@@ -13,7 +25,7 @@ pip3 install -r requirements.txt
 # Pull Ollama models
 ollama pull gpt-oss:20b
 
-# Start Ollama
+# Start Ollama (use CTRL + Z to background the server, type 'fg' to resume)
 ollama serve
 ```
 

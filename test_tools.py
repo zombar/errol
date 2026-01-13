@@ -9,7 +9,7 @@ from tools import (
 )
 from errol import (
     parse_tool_calls_from_text, extract_json_objects, looks_like_question,
-    DIM, RESET, GREEN, RED, YELLOW
+    looks_like_multi_step_plan, DIM, RESET, GREEN, RED, YELLOW
 )
 
 
@@ -397,6 +397,28 @@ def test_tool_aliases_defined(r: TestResults):
         r.fail("tool_aliases_defined", f"Missing aliases: {missing}")
 
 
+def test_looks_like_multi_step_plan_numbered(r: TestResults):
+    """looks_like_multi_step_plan should detect numbered steps."""
+    text = """Here's the plan:
+1. Create the Impact class
+2. Add the impacts list
+3. Spawn impacts on collision
+4. Draw impacts each frame"""
+    if looks_like_multi_step_plan(text):
+        r.ok("looks_like_multi_step_plan_numbered")
+    else:
+        r.fail("looks_like_multi_step_plan_numbered", "Expected True for numbered steps")
+
+
+def test_looks_like_multi_step_plan_single(r: TestResults):
+    """looks_like_multi_step_plan should return False for single change."""
+    text = "Change the color from WHITE to RED in the draw function."
+    if not looks_like_multi_step_plan(text):
+        r.ok("looks_like_multi_step_plan_single")
+    else:
+        r.fail("looks_like_multi_step_plan_single", "Expected False for single change")
+
+
 def run_all_tests() -> TestResults:
     """Run all tests and return results."""
     r = TestResults()
@@ -431,6 +453,10 @@ def run_all_tests() -> TestResults:
     # Question detection tests
     test_looks_like_question_true(r)
     test_looks_like_question_false(r)
+
+    # Multi-step plan detection tests
+    test_looks_like_multi_step_plan_numbered(r)
+    test_looks_like_multi_step_plan_single(r)
 
     # Indentation handling tests
     test_edit_file_tabs_to_spaces(r)

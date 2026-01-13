@@ -15,6 +15,16 @@ CYAN = "\033[96m"
 YELLOW = "\033[93m"
 RESET = "\033[0m"
 
+# Parameter aliases - map common alternative param names to canonical names
+# Format: {tool_name: {alias_param: canonical_param}}
+PARAM_ALIASES = {
+    "grep": {"query": "pattern", "search": "pattern", "regex": "pattern", "text": "pattern"},
+    "glob": {"query": "pattern", "search": "pattern", "name": "pattern"},
+    "read_file": {"file": "path", "filename": "path", "file_path": "path"},
+    "write_file": {"file": "path", "filename": "path", "file_path": "path"},
+    "edit_file": {"file": "path", "filename": "path", "file_path": "path"},
+}
+
 # Tool aliases - map common alternative names to canonical tool names
 TOOL_ALIASES = {
     # Common variations
@@ -112,8 +122,18 @@ def write_file(path: str = None, content: str = None) -> str:
         return f"Error writing file: {e}"
 
 def _clean_string(s: str) -> str:
-    """Clean string by removing line number prefixes and trailing whitespace."""
+    """Clean string by removing line number prefixes, trailing whitespace, and normalizing quotes."""
     import re
+    # Normalize smart quotes and special characters
+    replacements = {
+        '\u2018': "'", '\u2019': "'",  # curly single quotes
+        '\u201c': '"', '\u201d': '"',  # curly double quotes
+        '\u00a0': ' ',                  # non-breaking space
+        '\u2013': '-', '\u2014': '-',  # en/em dashes
+    }
+    for old, new in replacements.items():
+        s = s.replace(old, new)
+
     lines = s.split('\n')
     cleaned = []
     for line in lines:
@@ -305,6 +325,14 @@ def edit_file(path: str = None, old_string: str = None, new_string: str = None, 
             for i, file_line in enumerate(content.splitlines(), 1):
                 if search_stripped and search_stripped in file_line:
                     return f"Error: String not found in {path}.\nLooking for: {first_line[:60]!r}\nSimilar at line {i}: {file_line[:60]!r}\nCheck indentation (tabs vs spaces)."
+                # Check for near-matches with invisible character differences
+                file_stripped = file_line.strip()
+                if file_stripped and len(file_stripped) == len(search_stripped):
+                    diffs = sum(1 for a, b in zip(file_stripped, search_stripped) if a != b)
+                    if 0 < diffs <= 3:
+                        search_hex = ' '.join(f'{ord(c):02x}' for c in search_stripped[:30])
+                        file_hex = ' '.join(f'{ord(c):02x}' for c in file_stripped[:30])
+                        return f"Error: String not found in {path}.\nLooking for: {search_stripped[:50]!r}\nNear match at line {i}: {file_stripped[:50]!r}\nSearch hex: {search_hex}\nFile hex:   {file_hex}"
             return f"Error: String not found in {path}. Looking for: {first_line[:80]!r}"
 
         if replace_all:
@@ -430,14 +458,20 @@ def grep(pattern: str = None, path: str = ".", include: str = None) -> str:
         return f"Error searching: {e}"
 
 
-def todo_tool(action: str = None, content: str = None, active_form: str = None, task_id: str = None) -> str:
+def todo_tool(action: str = None, content: str = None, active_form: str = None,
+              task_id: str = None, parent_id: str = None,
+              file_path: str = None, anchor: str = None) -> str:
     """Manage task tracking for multi-step work.
 
     Actions:
     - list: Show all tasks with status
-    - add: Add a new task (requires content, optionally active_form)
+    - add: Add a new task (requires content, optionally active_form, parent_id, file_path, anchor)
     - start: Mark task as in_progress (requires task_id)
     - complete: Mark task as completed (requires task_id)
+
+    For 'add' action:
+    - file_path: Optional file path this task affects
+    - anchor: Optional semantic anchor (function/class name) for locating the edit
     """
     tracker = get_tracker()
 
@@ -454,8 +488,15 @@ def todo_tool(action: str = None, content: str = None, active_form: str = None, 
     elif action == "add":
         if not content:
             return "Error: 'content' parameter is required for 'add' action"
-        task_id = tracker.add(content, active_form)
-        return f"Added task '{content}' with ID: {task_id}"
+        new_task_id = tracker.add(content, active_form, parent_id, file_path, anchor)
+        # Build response with location info if provided
+        location = ""
+        if file_path or anchor:
+            parts = [p for p in [file_path, anchor] if p]
+            location = f" @ {':'.join(parts)}"
+        if parent_id:
+            return f"Added subtask '{content}'{location} with ID: {new_task_id} (parent: {parent_id})"
+        return f"Added task '{content}'{location} with ID: {new_task_id}"
 
     elif action == "start":
         if not task_id:
@@ -595,14 +636,17 @@ TOOLS = {
             "type": "function",
             "function": {
                 "name": "todo",
-                "description": "Manage task tracking. Use this to track progress on multi-step tasks. Actions: list (show tasks), add (create task), start (mark in_progress), complete (mark done).",
+                "description": "Manage task tracking. Use this to track progress on multi-step tasks. Actions: list (show tasks), add (create task with optional parent_id for subtasks, file_path and anchor for location hints), start (mark in_progress), complete (mark done).",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": {"type": "string", "description": "Action: list, add, start, complete"},
                         "content": {"type": "string", "description": "Task description (for 'add' action)"},
                         "active_form": {"type": "string", "description": "Present tense form (for 'add' action, e.g. 'Reading file')"},
-                        "task_id": {"type": "string", "description": "Task ID (for 'start' and 'complete' actions)"}
+                        "task_id": {"type": "string", "description": "Task ID (for 'start' and 'complete' actions)"},
+                        "parent_id": {"type": "string", "description": "Parent task ID to create a subtask (for 'add' action)"},
+                        "file_path": {"type": "string", "description": "File path this task affects (for 'add' action)"},
+                        "anchor": {"type": "string", "description": "Semantic anchor like function/class name for locating the edit (for 'add' action)"}
                     },
                     "required": ["action"]
                 }
@@ -692,6 +736,10 @@ def execute_tool(name: str, args: dict) -> str:
     import inspect
     import re
 
+    # Early rejection of obviously invalid tool names (channel markers, etc.)
+    if not name or any(c in name for c in '<>|'):
+        return f"Error: Invalid tool name '{name}'"
+
     # Resolve tool name (alias or fuzzy match)
     resolved_name, _ = resolve_tool_name(name)
 
@@ -703,6 +751,17 @@ def execute_tool(name: str, args: dict) -> str:
     for key, val in args.items():
         if isinstance(val, str) and re.search(r'<[a-zA-Z_-]+>', val):
             return f"Error: Placeholder detected in '{key}': {val}. Use actual values, not placeholders."
+
+    # Remap parameter aliases (e.g., query -> pattern for grep)
+    if resolved_name in PARAM_ALIASES:
+        param_map = PARAM_ALIASES[resolved_name]
+        remapped_args = {}
+        for key, val in args.items():
+            canonical_key = param_map.get(key, key)
+            # Don't overwrite if canonical param already exists
+            if canonical_key not in remapped_args:
+                remapped_args[canonical_key] = val
+        args = remapped_args
 
     # Auto-convert relative paths to absolute for path arguments
     if 'path' in args and args['path']:
