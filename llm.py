@@ -38,7 +38,8 @@ class OllamaClient:
             yield resp.json()
 
     def chat_sync(self, model: str, messages: list[dict],
-                  tools: Optional[list] = None) -> dict:
+                  tools: Optional[list] = None,
+                  tool_choice: Optional[str] = "auto") -> dict:
         """Non-streaming chat. Returns full response."""
         payload = {
             "model": model,
@@ -47,6 +48,8 @@ class OllamaClient:
         }
         if tools:
             payload["tools"] = tools
+            if tool_choice:
+                payload["tool_choice"] = tool_choice
 
         resp = requests.post(
             f"{self.host}/api/chat",
