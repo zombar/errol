@@ -114,8 +114,25 @@ def looks_like_code_suggestion(text: str) -> bool:
         'the new version',
     ]
 
+    # Action descriptions that imply edits should be made (gpt-oss pattern)
+    action_indicators = [
+        'delete the',
+        'remove the',
+        'exact change required',
+        'change required',
+        'after the edit',
+        'should only contain',
+        'this will restore',
+        'this will fix',
+        'need to delete',
+        'need to remove',
+        'need to change',
+        'need to edit',
+        'need to update',
+    ]
+
     text_lower = text.lower()
-    for indicator in code_indicators:
+    for indicator in code_indicators + action_indicators:
         if indicator in text or indicator in text_lower:
             return True
 
@@ -362,27 +379,37 @@ def preview_file_change(name: str, args: dict) -> str:
     p = Path(path).expanduser().resolve()
 
     if name == "edit_file" and p.exists() and p.is_file():
+        from tools import _find_match, _adjust_replacement_indent
         old_string = args.get("old_string", "")
         new_string = args.get("new_string", "")
+        replace_all = args.get("replace_all", False)
         if not old_string:
             return ""
         content = p.read_text()
-        count = content.count(old_string)
-        if count == 1:
-            new_content = content.replace(old_string, new_string)
-            return show_diff(content, new_content, p.name)
-        elif count == 0:
+        m = _find_match(content, old_string, new_string)
+
+        if m['type'] == 'flexible':
+            start, end, matched_text = m['match']
+            adjusted_new = _adjust_replacement_indent(new_string, matched_text)
+            new_content = content[:start] + adjusted_new + content[end:]
+            return show_diff(content, new_content, p.name) + f"\n{DIM}(flexible match){RESET}"
+
+        if m['type'] is not None:
+            if replace_all:
+                new_content = m['content'].replace(m['old'], m['new'])
+            else:
+                new_content = m['content'].replace(m['old'], m['new'], 1)
+            suffix = f"\n{DIM}(first of {m['count']}){RESET}" if m['count'] > 1 and not replace_all else ""
+            return show_diff(m['content'], new_content, p.name) + suffix
+        else:
             # String not found - try to find close matches
             lines = content.splitlines()
             old_lines = old_string.splitlines()
             if old_lines:
-                # Find best matching line
                 matches = difflib.get_close_matches(old_lines[0].strip(), [l.strip() for l in lines], n=1, cutoff=0.6)
                 if matches:
                     return f"{RED}String not found.{RESET} Similar line exists:\n{DIM}{matches[0]}{RESET}\n{YELLOW}Check indentation/whitespace.{RESET}"
             return f"{RED}String not found in file.{RESET} {YELLOW}Check indentation/whitespace.{RESET}"
-        else:
-            return f"{YELLOW}String found {count} times (must be unique).{RESET}"
     elif name == "write_file":
         new_content = args.get("content", "")
         if p.exists() and p.is_file():

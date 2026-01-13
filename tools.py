@@ -90,6 +90,154 @@ def _clean_string(s: str) -> str:
         cleaned.append(line)
     return '\n'.join(cleaned)
 
+def _find_block_flexible(content: str, search: str) -> Optional[tuple]:
+    """Find search block by matching line content, ignoring leading whitespace.
+
+    Returns (start_pos, end_pos, matched_text) or None if not found.
+    """
+    content_lines = content.split('\n')
+    search_lines = _clean_string(search).split('\n')
+
+    # Strip leading/trailing whitespace from search lines for matching
+    search_stripped = [line.strip() for line in search_lines if line.strip()]
+
+    if not search_stripped:
+        return None
+
+    for i in range(len(content_lines) - len(search_stripped) + 1):
+        match = True
+        for j, search_line in enumerate(search_stripped):
+            content_stripped = content_lines[i + j].strip()
+            if content_stripped != search_line:
+                match = False
+                break
+
+        if match:
+            # Calculate positions in original content
+            start_pos = sum(len(l) + 1 for l in content_lines[:i])
+            matched_lines = content_lines[i:i + len(search_stripped)]
+            matched_text = '\n'.join(matched_lines)
+            end_pos = start_pos + len(matched_text)
+            return start_pos, end_pos, matched_text
+
+    return None
+
+def _find_match(content: str, old_string: str, new_string: str = None):
+    """Find old_string in content using fallback matching strategies.
+
+    Returns dict with:
+        - 'type': 'exact', 'cleaned', 'flexible', or None if not found
+        - 'count': number of matches (for exact/cleaned)
+        - 'old': actual old_string to use for replacement
+        - 'new': actual new_string to use for replacement
+        - 'content': content to use (may be normalized)
+        - 'match': (start, end, matched_text) for flexible match
+    """
+    if new_string is None:
+        new_string = ""
+
+    # Try exact match
+    count = content.count(old_string)
+    if count > 0:
+        return {
+            'type': 'exact',
+            'count': count,
+            'old': old_string,
+            'new': new_string,
+            'content': content,
+            'match': None
+        }
+
+    # Fallback 1: cleaned strings (line numbers, trailing whitespace)
+    cleaned_old = _clean_string(old_string)
+    cleaned_new = _clean_string(new_string)
+    content_normalized = '\n'.join(line.rstrip() for line in content.split('\n'))
+    count = content_normalized.count(cleaned_old)
+    if count > 0:
+        return {
+            'type': 'cleaned',
+            'count': count,
+            'old': cleaned_old,
+            'new': cleaned_new,
+            'content': content_normalized,
+            'match': None
+        }
+
+    # Fallback 2: flexible line-based matching
+    match = _find_block_flexible(content, old_string)
+    if match:
+        return {
+            'type': 'flexible',
+            'count': 1,
+            'old': old_string,
+            'new': new_string,
+            'content': content,
+            'match': match
+        }
+
+    return {'type': None, 'count': 0, 'old': old_string, 'new': new_string, 'content': content, 'match': None}
+
+def _adjust_replacement_indent(new_string: str, original_match: str) -> str:
+    """Adjust new_string to use the same indentation style as original_match."""
+    orig_lines = original_match.split('\n')
+    new_lines = _clean_string(new_string).split('\n')
+
+    # Detect indent unit from original (first indented content after base)
+    orig_base_indent = ''
+    orig_indent_unit = '\t'  # default to tab
+    for line in orig_lines:
+        if line.strip():
+            orig_base_indent = line[:len(line) - len(line.lstrip())]
+            # Detect if using spaces or tabs
+            if orig_base_indent and orig_base_indent[0] == ' ':
+                orig_indent_unit = orig_base_indent  # use full indent as unit
+            elif orig_base_indent:
+                orig_indent_unit = '\t'
+            break
+
+    # Detect indent unit from new_string
+    new_base_indent = ''
+    new_indent_unit = '    '  # default to 4 spaces
+    for line in new_lines:
+        if line.strip():
+            new_base_indent = line[:len(line) - len(line.lstrip())]
+            if new_base_indent and new_base_indent[0] == '\t':
+                new_indent_unit = '\t'
+            elif new_base_indent:
+                new_indent_unit = new_base_indent
+            break
+
+    # Calculate base indent level
+    def count_indent_level(indent: str, unit: str) -> int:
+        if not unit or not indent:
+            return 0
+        if unit == '\t':
+            return indent.count('\t')
+        return len(indent) // len(unit) if unit else 0
+
+    orig_base_level = count_indent_level(orig_base_indent, orig_indent_unit)
+    new_base_level = count_indent_level(new_base_indent, new_indent_unit)
+
+    # Build result with adjusted indentation
+    result = []
+    for i, line in enumerate(new_lines):
+        if not line.strip():
+            result.append('')
+            continue
+
+        line_indent = line[:len(line) - len(line.lstrip())]
+        line_level = count_indent_level(line_indent, new_indent_unit)
+
+        # Calculate relative level from base
+        relative_level = line_level - new_base_level
+
+        # Apply original's base level plus relative
+        target_level = orig_base_level + relative_level
+        new_indent = orig_indent_unit * target_level
+        result.append(new_indent + line.lstrip())
+
+    return '\n'.join(result)
+
 def edit_file(path: str = None, old_string: str = None, new_string: str = None, replace_all: bool = False) -> str:
     """Replace old_string with new_string in file."""
     try:
@@ -107,37 +255,30 @@ def edit_file(path: str = None, old_string: str = None, new_string: str = None, 
             return f"Error: File not found: {path}"
 
         content = p.read_text()
-        count = content.count(old_string)
+        m = _find_match(content, old_string, new_string)
 
-        # If not found, try with cleaned strings (no line numbers, no trailing whitespace)
-        if count == 0:
-            cleaned_old = _clean_string(old_string)
-            cleaned_new = _clean_string(new_string)
-            # Normalize file content too (strip trailing whitespace per line)
-            content_normalized = '\n'.join(line.rstrip() for line in content.split('\n'))
-            count = content_normalized.count(cleaned_old)
-            if count > 0:
-                # Use cleaned versions
-                old_string = cleaned_old
-                new_string = cleaned_new
-                content = content_normalized
+        if m['type'] == 'flexible':
+            start, end, matched_text = m['match']
+            adjusted_new = _adjust_replacement_indent(new_string, matched_text)
+            new_content = content[:start] + adjusted_new + content[end:]
+            p.write_text(new_content)
+            return f"Edited {path}: applied changes (flexible match)"
 
-        if count == 0:
+        if m['type'] is None:
             # Show first line and try to find similar content
             first_line = old_string.split('\n')[0]
-            # Search for similar line in file (strip whitespace for comparison)
             search_stripped = first_line.strip()
             for i, file_line in enumerate(content.splitlines(), 1):
                 if search_stripped and search_stripped in file_line:
                     return f"Error: String not found in {path}.\nLooking for: {first_line[:60]!r}\nSimilar at line {i}: {file_line[:60]!r}\nCheck indentation (tabs vs spaces)."
             return f"Error: String not found in {path}. Looking for: {first_line[:80]!r}"
+
         if replace_all:
-            new_content = content.replace(old_string, new_string)
-            replaced_msg = f" ({count} occurrences)" if count > 1 else ""
+            new_content = m['content'].replace(m['old'], m['new'])
+            replaced_msg = f" ({m['count']} occurrences)" if m['count'] > 1 else ""
         else:
-            # Replace only the first occurrence
-            new_content = content.replace(old_string, new_string, 1)
-            replaced_msg = f" (first of {count})" if count > 1 else ""
+            new_content = m['content'].replace(m['old'], m['new'], 1)
+            replaced_msg = f" (first of {m['count']})" if m['count'] > 1 else ""
 
         p.write_text(new_content)
         return f"Edited {path}: applied changes{replaced_msg}"
@@ -384,22 +525,20 @@ def validate_tool_call(name: str, args: dict) -> Optional[str]:
         if isinstance(val, str) and re.search(r'<[a-zA-Z_-]+>', val):
             return f"Placeholder detected in '{key}': {val}. Use actual values."
 
-    # Validate edit_file: check string exists and is unique (unless replace_all)
+    # Validate edit_file: check string exists
     if name == "edit_file":
         path = args.get("path", "")
         old_string = args.get("old_string", "")
-        replace_all = args.get("replace_all", False)
         if path and old_string:
             p = Path(path).expanduser().resolve()
             if not p.exists():
                 return f"File not found: {path}"
             try:
                 content = p.read_text()
-                count = content.count(old_string)
-                if count == 0:
+                m = _find_match(content, old_string)
+                if m['type'] is None:
                     first_line = old_string.split('\n')[0][:80]
                     return f"String not found in {path}. Looking for: {first_line!r}"
-                # Allow multiple matches - will replace first by default
             except Exception as e:
                 return f"Cannot read file: {e}"
 

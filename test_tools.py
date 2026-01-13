@@ -261,6 +261,87 @@ def test_looks_like_question_false(r: TestResults):
         r.ok("looks_like_question_false")
 
 
+def test_edit_file_tabs_to_spaces(r: TestResults):
+    """edit_file should match file with tabs when search uses spaces."""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write("\tdef foo():\n\t\tpass\n")  # tabs
+        path = f.name
+    try:
+        result = edit_file(
+            path=path,
+            old_string="    def foo():\n        pass",  # spaces (4 and 8)
+            new_string="    def bar():\n        pass"
+        )
+        content = Path(path).read_text()
+        if "def bar" in content:
+            r.ok("edit_file_tabs_to_spaces")
+        else:
+            r.fail("edit_file_tabs_to_spaces", f"Expected 'def bar', got: {content!r}")
+    finally:
+        os.unlink(path)
+
+
+def test_edit_file_spaces_to_tabs(r: TestResults):
+    """edit_file should match file with spaces when search uses tabs."""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write("    def foo():\n        return 1\n")  # spaces
+        path = f.name
+    try:
+        result = edit_file(
+            path=path,
+            old_string="\tdef foo():\n\t\treturn 1",  # tabs
+            new_string="\tdef bar():\n\t\treturn 2"
+        )
+        content = Path(path).read_text()
+        if "def bar" in content and "return 2" in content:
+            r.ok("edit_file_spaces_to_tabs")
+        else:
+            r.fail("edit_file_spaces_to_tabs", f"Expected 'def bar', got: {content!r}")
+    finally:
+        os.unlink(path)
+
+
+def test_edit_file_preserves_indent_style(r: TestResults):
+    """edit_file should preserve the file's original indentation style."""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write("\tdef foo():\n\t\treturn 1\n")  # tabs
+        path = f.name
+    try:
+        result = edit_file(
+            path=path,
+            old_string="    def foo():\n        return 1",  # spaces
+            new_string="    def bar():\n        return 2"   # spaces
+        )
+        content = Path(path).read_text()
+        # Should preserve tabs from original file
+        if "\tdef bar" in content and "\t\treturn 2" in content:
+            r.ok("edit_file_preserves_indent_style")
+        else:
+            r.fail("edit_file_preserves_indent_style", f"Expected tabs preserved, got: {content!r}")
+    finally:
+        os.unlink(path)
+
+
+def test_validate_uses_flexible_fallback(r: TestResults):
+    """validate_tool_call should pass when flexible matching would succeed."""
+    from tools import validate_tool_call
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write("\tdef foo():\n\t\tpass\n")  # tabs
+        path = f.name
+    try:
+        result = validate_tool_call("edit_file", {
+            "path": path,
+            "old_string": "    def foo():\n        pass",  # spaces
+            "new_string": "    def bar():\n        pass"
+        })
+        if result is None:
+            r.ok("validate_uses_flexible_fallback")
+        else:
+            r.fail("validate_uses_flexible_fallback", f"Expected None (valid), got: {result}")
+    finally:
+        os.unlink(path)
+
+
 def run_all_tests() -> TestResults:
     """Run all tests and return results."""
     r = TestResults()
@@ -295,6 +376,12 @@ def run_all_tests() -> TestResults:
     # Question detection tests
     test_looks_like_question_true(r)
     test_looks_like_question_false(r)
+
+    # Indentation handling tests
+    test_edit_file_tabs_to_spaces(r)
+    test_edit_file_spaces_to_tabs(r)
+    test_edit_file_preserves_indent_style(r)
+    test_validate_uses_flexible_fallback(r)
 
     return r
 
