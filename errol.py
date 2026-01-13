@@ -33,8 +33,9 @@ RL_START = "\001"  # Start of non-printing sequence
 RL_END = "\002"    # End of non-printing sequence
 
 # Read-only tools that auto-execute after countdown
-READONLY_TOOLS = ("read_file", "glob", "grep")
+READONLY_TOOLS = ("read_file", "glob", "grep", "todo")
 from tools import execute_tool, get_tool_schemas, validate_tool_call, TOOLS
+from task_tracker import get_tracker, reset_tracker
 
 
 def looks_like_question(text: str) -> bool:
@@ -483,6 +484,10 @@ def confirm_tool(name: str, args: dict) -> bool:
 
 def agent_loop(task: str, config: dict) -> bool:
     """Main agent execution loop. Returns True if cancelled by ESC."""
+    # Reset task tracker for this session
+    reset_tracker()
+    tracker = get_tracker()
+
     client = OllamaClient(
         host=config["ollama"]["host"],
         timeout=config["ollama"]["timeout"]
@@ -634,6 +639,14 @@ def agent_loop(task: str, config: dict) -> bool:
                     "content": result
                 })
 
+                # Inject task context reminder if there are tracked tasks
+                if tracker.has_tasks() and name != "todo":
+                    task_context = tracker.to_prompt_context()
+                    messages.append({
+                        "role": "user",
+                        "content": f"[Task Reminder]\n{task_context}\n\nContinue with the current task."
+                    })
+
                 # Boost reasoning after successful file read to help analyze content
                 if name == "read_file" and not result.startswith("Error"):
                     messages.append({
@@ -735,18 +748,27 @@ def self_check():
         sys.exit(1)
 
     # Step 2: Run unit tests
-    print(f"\n{CYAN}◆{RESET} {BOLD}Unit Tests{RESET}")
-    from test_tools import run_all_tests
-    results = run_all_tests()
+    print(f"\n{CYAN}◆{RESET} {BOLD}Unit Tests (tools){RESET}")
+    from test_tools import run_all_tests as run_tool_tests
+    results = run_tool_tests()
 
-    if results.failed > 0:
-        print(f"\n{RED}✗{RESET} {results.passed} passed, {results.failed} failed")
+    print(f"\n{CYAN}◆{RESET} {BOLD}Unit Tests (task_tracker){RESET}")
+    from test_task_tracker import run_all_tests as run_tracker_tests
+    tracker_results = run_tracker_tests()
+
+    # Combine results
+    total_passed = results.passed + tracker_results.passed
+    total_failed = results.failed + tracker_results.failed
+    all_errors = results.errors + tracker_results.errors
+
+    if total_failed > 0:
+        print(f"\n{RED}✗{RESET} {total_passed} passed, {total_failed} failed")
         print(f"\n{DIM}Failures:{RESET}")
-        for name, msg in results.errors:
+        for name, msg in all_errors:
             print(f"  {RED}✗{RESET} {name}: {DIM}{msg}{RESET}")
         sys.exit(1)
 
-    print(f"\n{GREEN}✓{RESET} All {results.passed} tests passed")
+    print(f"\n{GREEN}✓{RESET} All {total_passed} tests passed")
 
 
 if __name__ == "__main__":

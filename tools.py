@@ -6,11 +6,45 @@ import difflib
 from pathlib import Path
 from typing import Optional
 
+from task_tracker import get_tracker
+
 # ANSI colors for diff output
 RED = "\033[91m"
 GREEN = "\033[92m"
 CYAN = "\033[96m"
+YELLOW = "\033[93m"
 RESET = "\033[0m"
+
+# Tool aliases - map common alternative names to canonical tool names
+TOOL_ALIASES = {
+    # Common variations
+    "search": "grep",
+    "find": "glob",
+    "find_files": "glob",
+    "search_files": "grep",
+    "cat": "read_file",
+    "read": "read_file",
+    "write": "write_file",
+    "edit": "edit_file",
+    "run": "bash",
+    "execute": "bash",
+    "shell": "bash",
+    "exec": "bash",
+    "rg": "grep",
+    "ripgrep": "grep",
+    # Hallucinated names seen in practice
+    "file_read": "read_file",
+    "file_write": "write_file",
+    "file_edit": "edit_file",
+    "run_command": "bash",
+    "search_content": "grep",
+    # Todo tool aliases
+    "task": "todo",
+    "tasks": "todo",
+    "todo_list": "todo",
+    "track": "todo",
+}
+
 
 def show_diff(old: str, new: str, path: str) -> str:
     """Generate a colored unified diff."""
@@ -395,6 +429,52 @@ def grep(pattern: str = None, path: str = ".", include: str = None) -> str:
     except Exception as e:
         return f"Error searching: {e}"
 
+
+def todo_tool(action: str = None, content: str = None, active_form: str = None, task_id: str = None) -> str:
+    """Manage task tracking for multi-step work.
+
+    Actions:
+    - list: Show all tasks with status
+    - add: Add a new task (requires content, optionally active_form)
+    - start: Mark task as in_progress (requires task_id)
+    - complete: Mark task as completed (requires task_id)
+    """
+    tracker = get_tracker()
+
+    if not action:
+        return "Error: 'action' parameter is required. Use: list, add, start, complete"
+
+    action = action.lower().strip()
+
+    if action == "list":
+        if not tracker.has_tasks():
+            return "No tasks tracked yet."
+        return tracker.to_prompt_context()
+
+    elif action == "add":
+        if not content:
+            return "Error: 'content' parameter is required for 'add' action"
+        task_id = tracker.add(content, active_form)
+        return f"Added task '{content}' with ID: {task_id}"
+
+    elif action == "start":
+        if not task_id:
+            return "Error: 'task_id' parameter is required for 'start' action"
+        if tracker.set_status(task_id, "in_progress"):
+            return f"Task {task_id} marked as in_progress"
+        return f"Error: Task '{task_id}' not found"
+
+    elif action == "complete":
+        if not task_id:
+            return "Error: 'task_id' parameter is required for 'complete' action"
+        if tracker.set_status(task_id, "completed"):
+            return f"Task {task_id} marked as completed"
+        return f"Error: Task '{task_id}' not found"
+
+    else:
+        return f"Error: Unknown action '{action}'. Use: list, add, start, complete"
+
+
 # Tool registry with schemas for Ollama
 TOOLS = {
     "read_file": {
@@ -508,15 +588,67 @@ TOOLS = {
                 }
             }
         }
+    },
+    "todo": {
+        "fn": todo_tool,
+        "schema": {
+            "type": "function",
+            "function": {
+                "name": "todo",
+                "description": "Manage task tracking. Use this to track progress on multi-step tasks. Actions: list (show tasks), add (create task), start (mark in_progress), complete (mark done).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "description": "Action: list, add, start, complete"},
+                        "content": {"type": "string", "description": "Task description (for 'add' action)"},
+                        "active_form": {"type": "string", "description": "Present tense form (for 'add' action, e.g. 'Reading file')"},
+                        "task_id": {"type": "string", "description": "Task ID (for 'start' and 'complete' actions)"}
+                    },
+                    "required": ["action"]
+                }
+            }
+        }
     }
 }
+
+
+def resolve_tool_name(name: str) -> tuple[str, bool]:
+    """Resolve tool name, with alias and fuzzy matching fallback.
+
+    Returns (resolved_name, was_fuzzy_match).
+    """
+    from difflib import get_close_matches
+
+    # Exact match
+    if name in TOOLS:
+        return name, False
+
+    # Check aliases
+    if name in TOOL_ALIASES:
+        return TOOL_ALIASES[name], False
+
+    # Try fuzzy match against both tool names and aliases
+    all_names = list(TOOLS.keys()) + list(TOOL_ALIASES.keys())
+    matches = get_close_matches(name, all_names, n=1, cutoff=0.6)
+    if matches:
+        matched = matches[0]
+        # If matched an alias, resolve to canonical name
+        resolved = TOOL_ALIASES.get(matched, matched)
+        print(f"{YELLOW}⚠ Fuzzy matched '{name}' → '{resolved}'{RESET}")
+        return resolved, True
+
+    return name, False  # Return original, will fail validation
+
 
 def validate_tool_call(name: str, args: dict) -> Optional[str]:
     """Pre-validate a tool call. Returns error string if invalid, None if OK."""
     import re
 
+    # Resolve tool name (alias or fuzzy match)
+    resolved_name, _ = resolve_tool_name(name)
+
     # Check tool exists
-    if name not in TOOLS:
+    if resolved_name not in TOOLS:
         available = ", ".join(TOOLS.keys())
         return f"Unknown tool '{name}'. Available tools: {available}"
 
@@ -526,7 +658,7 @@ def validate_tool_call(name: str, args: dict) -> Optional[str]:
             return f"Placeholder detected in '{key}': {val}. Use actual values."
 
     # Validate edit_file: check string exists
-    if name == "edit_file":
+    if resolved_name == "edit_file":
         path = args.get("path", "")
         old_string = args.get("old_string", "")
         if path and old_string:
@@ -543,7 +675,7 @@ def validate_tool_call(name: str, args: dict) -> Optional[str]:
                 return f"Cannot read file: {e}"
 
     # Validate read_file: check file exists
-    if name == "read_file":
+    if resolved_name == "read_file":
         path = args.get("path", "")
         if path:
             p = Path(path).expanduser().resolve()
@@ -560,7 +692,10 @@ def execute_tool(name: str, args: dict) -> str:
     import inspect
     import re
 
-    if name not in TOOLS:
+    # Resolve tool name (alias or fuzzy match)
+    resolved_name, _ = resolve_tool_name(name)
+
+    if resolved_name not in TOOLS:
         available = ", ".join(TOOLS.keys())
         return f"Error: Unknown tool '{name}'. Available tools: {available}"
 
@@ -575,7 +710,7 @@ def execute_tool(name: str, args: dict) -> str:
         if not p.startswith('/') and not p.startswith('~'):
             args['path'] = str(Path.cwd() / p)
 
-    fn = TOOLS[name]["fn"]
+    fn = TOOLS[resolved_name]["fn"]
     # Filter args to only include valid parameters for the function
     sig = inspect.signature(fn)
     valid_params = set(sig.parameters.keys())

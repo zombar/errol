@@ -5,7 +5,7 @@ from pathlib import Path
 
 from tools import (
     read_file, write_file, edit_file, run_bash, glob_files,
-    execute_tool
+    execute_tool, resolve_tool_name, TOOL_ALIASES
 )
 from errol import (
     parse_tool_calls_from_text, extract_json_objects, looks_like_question,
@@ -342,6 +342,61 @@ def test_validate_uses_flexible_fallback(r: TestResults):
         os.unlink(path)
 
 
+def test_resolve_tool_name_exact(r: TestResults):
+    """resolve_tool_name should return exact match."""
+    name, was_fuzzy = resolve_tool_name("bash")
+    if name == "bash" and not was_fuzzy:
+        r.ok("resolve_tool_name_exact")
+    else:
+        r.fail("resolve_tool_name_exact", f"Expected ('bash', False), got: ({name}, {was_fuzzy})")
+
+
+def test_resolve_tool_name_alias(r: TestResults):
+    """resolve_tool_name should resolve aliases."""
+    name, was_fuzzy = resolve_tool_name("search")
+    if name == "grep" and not was_fuzzy:
+        r.ok("resolve_tool_name_alias")
+    else:
+        r.fail("resolve_tool_name_alias", f"Expected ('grep', False), got: ({name}, {was_fuzzy})")
+
+
+def test_resolve_tool_name_fuzzy(r: TestResults):
+    """resolve_tool_name should fuzzy match typos."""
+    name, was_fuzzy = resolve_tool_name("greb")  # typo for grep
+    if name == "grep" and was_fuzzy:
+        r.ok("resolve_tool_name_fuzzy")
+    else:
+        r.fail("resolve_tool_name_fuzzy", f"Expected ('grep', True), got: ({name}, {was_fuzzy})")
+
+
+def test_resolve_tool_name_unknown(r: TestResults):
+    """resolve_tool_name should return original for unknown tools."""
+    name, was_fuzzy = resolve_tool_name("totally_unknown_xyz")
+    if name == "totally_unknown_xyz" and not was_fuzzy:
+        r.ok("resolve_tool_name_unknown")
+    else:
+        r.fail("resolve_tool_name_unknown", f"Expected ('totally_unknown_xyz', False), got: ({name}, {was_fuzzy})")
+
+
+def test_execute_tool_with_alias(r: TestResults):
+    """execute_tool should work with tool aliases."""
+    result = execute_tool("run", {"command": "echo hello_alias_test"})
+    if "hello_alias_test" in result:
+        r.ok("execute_tool_with_alias")
+    else:
+        r.fail("execute_tool_with_alias", f"Expected 'hello_alias_test', got: {result}")
+
+
+def test_tool_aliases_defined(r: TestResults):
+    """TOOL_ALIASES should have common aliases defined."""
+    expected = ["search", "find", "cat", "run", "shell"]
+    missing = [a for a in expected if a not in TOOL_ALIASES]
+    if not missing:
+        r.ok("tool_aliases_defined")
+    else:
+        r.fail("tool_aliases_defined", f"Missing aliases: {missing}")
+
+
 def run_all_tests() -> TestResults:
     """Run all tests and return results."""
     r = TestResults()
@@ -382,6 +437,14 @@ def run_all_tests() -> TestResults:
     test_edit_file_spaces_to_tabs(r)
     test_edit_file_preserves_indent_style(r)
     test_validate_uses_flexible_fallback(r)
+
+    # Tool name resolution tests
+    test_resolve_tool_name_exact(r)
+    test_resolve_tool_name_alias(r)
+    test_resolve_tool_name_fuzzy(r)
+    test_resolve_tool_name_unknown(r)
+    test_execute_tool_with_alias(r)
+    test_tool_aliases_defined(r)
 
     return r
 
