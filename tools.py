@@ -131,12 +131,15 @@ def edit_file(path: str = None, old_string: str = None, new_string: str = None, 
                 if search_stripped and search_stripped in file_line:
                     return f"Error: String not found in {path}.\nLooking for: {first_line[:60]!r}\nSimilar at line {i}: {file_line[:60]!r}\nCheck indentation (tabs vs spaces)."
             return f"Error: String not found in {path}. Looking for: {first_line[:80]!r}"
-        if count > 1 and not replace_all:
-            return f"Error: String found {count} times, must be unique. Use replace_all=true to replace all occurrences."
+        if replace_all:
+            new_content = content.replace(old_string, new_string)
+            replaced_msg = f" ({count} occurrences)" if count > 1 else ""
+        else:
+            # Replace only the first occurrence
+            new_content = content.replace(old_string, new_string, 1)
+            replaced_msg = f" (first of {count})" if count > 1 else ""
 
-        new_content = content.replace(old_string, new_string)
         p.write_text(new_content)
-        replaced_msg = f" ({count} occurrences)" if count > 1 else ""
         return f"Edited {path}: applied changes{replaced_msg}"
     except Exception as e:
         return f"Error editing file: {e}"
@@ -396,8 +399,7 @@ def validate_tool_call(name: str, args: dict) -> Optional[str]:
                 if count == 0:
                     first_line = old_string.split('\n')[0][:80]
                     return f"String not found in {path}. Looking for: {first_line!r}"
-                if count > 1 and not replace_all:
-                    return f"String found {count} times, must be unique. Use replace_all=true to replace all."
+                # Allow multiple matches - will replace first by default
             except Exception as e:
                 return f"Cannot read file: {e}"
 

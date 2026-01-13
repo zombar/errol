@@ -33,7 +33,7 @@ RL_START = "\001"  # Start of non-printing sequence
 RL_END = "\002"    # End of non-printing sequence
 
 # Read-only tools that auto-execute after countdown
-READONLY_TOOLS = ("read_file", "glob")
+READONLY_TOOLS = ("read_file", "glob", "grep")
 from tools import execute_tool, get_tool_schemas, validate_tool_call, TOOLS
 
 
@@ -87,6 +87,55 @@ def looks_like_question(text: str) -> bool:
             return True
 
     return False
+
+
+def looks_like_code_suggestion(text: str) -> bool:
+    """Detect if the model described code changes without calling a tool."""
+    if not text:
+        return False
+
+    # Indicators that model is showing/describing code changes
+    code_indicators = [
+        '```',           # Code block
+        '@@',            # Diff marker
+        '+ ',            # Diff addition (with space)
+        '- ',            # Diff removal (with space)
+        'change this',
+        'replace this',
+        'modify this',
+        'update this',
+        'should be changed to',
+        'could be changed to',
+        'would look like',
+        'here is the',
+        'here\'s the',
+        'the updated',
+        'the modified',
+        'the new version',
+    ]
+
+    text_lower = text.lower()
+    for indicator in code_indicators:
+        if indicator in text or indicator in text_lower:
+            return True
+
+    return False
+
+
+def extract_reasoning_level(task: str) -> tuple[str, str]:
+    """Extract reasoning level prefix from task. Returns (level, cleaned_task).
+
+    Supports prefixes like Claude's 'ultrathink':
+    - 'ultrathink:' or 'think hard:' -> high reasoning
+    - 'quick:' -> low reasoning
+    - default -> medium reasoning
+    """
+    task_lower = task.lower()
+    if task_lower.startswith("ultrathink:") or task_lower.startswith("think hard:"):
+        return "high", task.split(":", 1)[1].strip()
+    elif task_lower.startswith("quick:"):
+        return "low", task.split(":", 1)[1].strip()
+    return "medium", task
 
 
 def extract_json_objects(text: str) -> list[str]:
@@ -263,33 +312,33 @@ class Timer:
 SELF_PATH = Path(__file__).parent.resolve()
 
 SYSTEM_PROMPT = """You are Errol, a helpful coding and devops assistant.
+Reasoning: {reasoning_level}
 
 Current working directory: {cwd}
 
-## Available Tools (ONLY these exist - no others):
-- read_file(path, offset, limit): Read file contents
-- write_file(path, content): Create or overwrite files
-- edit_file(path, old_string, new_string, replace_all=false): Find/replace string in file
-- bash(command, timeout): Run shell commands
-- glob(pattern, path): Find files by filename pattern (e.g. **/*.py)
-- grep(pattern, path, include): Search for text inside files
+## Tool Definitions (use ONLY these - no others exist):
 
-IMPORTANT: These are the ONLY tools. Do not try "search", "container.exec", "repo_browser", or any other tool names.
+{{"name": "read_file", "parameters": {{"path": "string", "offset": "int (optional)", "limit": "int (optional)"}}}}
+{{"name": "write_file", "parameters": {{"path": "string", "content": "string"}}}}
+{{"name": "edit_file", "parameters": {{"path": "string", "old_string": "string", "new_string": "string"}}}}
+{{"name": "bash", "parameters": {{"command": "string", "timeout": "int (optional)"}}}}
+{{"name": "glob", "parameters": {{"pattern": "string", "path": "string (optional)"}}}}
+{{"name": "grep", "parameters": {{"pattern": "string", "path": "string (optional)"}}}}
+
+IMPORTANT: These are the ONLY 6 tools. Do not try "search", "container.exec", "repo_browser", or any other names.
 
 ## CRITICAL: Stay On Task
 - Your ONLY job is to answer/complete what the user asked
 - Do NOT provide unsolicited code reviews, analysis, or suggestions
-- Do NOT explain what the code does unless asked
 - After reading files, IMMEDIATELY address the user's original request
-- If the user asks to add/modify something, DO that - don't analyze instead
-- When the task is clear, proceed without asking "what do you want me to do"
+- If asked to modify something, call edit_file - do not just show the change
 
 ## Rules:
 - Call ONE tool at a time, wait for result
+- To modify files you MUST call edit_file - describing changes is NOT enough
 
 ## Completion Requirement:
 After gathering information, you MUST directly address the user's original request.
-Do not summarize what you read - do what the user asked.
 """
 
 def load_config() -> dict:
@@ -428,12 +477,15 @@ def agent_loop(task: str, config: dict) -> bool:
 
     print(f"\n{MAGENTA}▶ errol{RESET} {DIM}using {model}{RESET}")
 
-    # Build system prompt
-    system = SYSTEM_PROMPT.format(cwd=os.getcwd())
+    # Extract reasoning level from task (ultrathink:, quick:, etc.)
+    reasoning_level, clean_task = extract_reasoning_level(task)
+
+    # Build system prompt with reasoning level
+    system = SYSTEM_PROMPT.format(cwd=os.getcwd(), reasoning_level=reasoning_level)
 
     messages = [
         {"role": "system", "content": system},
-        {"role": "user", "content": task}
+        {"role": "user", "content": clean_task}
     ]
 
     tools = get_tool_schemas()
@@ -441,6 +493,7 @@ def agent_loop(task: str, config: dict) -> bool:
     timer = Timer()
     reprompt_count = 0
     max_reprompts = 5
+    last_file_read = None  # Track last file for context in prompts
 
     for turn in range(max_turns):
         # Get response (non-streaming for reliable tool calls)
@@ -483,6 +536,12 @@ def agent_loop(task: str, config: dict) -> bool:
         # Fallback: parse tool calls from text if model doesn't use native format
         if not tool_calls and full_content:
             tool_calls = parse_tool_calls_from_text(full_content)
+
+        # Fallback: gpt-oss sometimes puts tool calls in reasoning_content
+        if not tool_calls:
+            reasoning = msg.get("reasoning_content", "")
+            if reasoning:
+                tool_calls = parse_tool_calls_from_text(reasoning)
 
         if full_content:
             # Clean up escaped newlines and format output
@@ -535,6 +594,9 @@ def agent_loop(task: str, config: dict) -> bool:
                         print(f"{RED}✗{RESET} {result[:500]}{'...' if len(result) > 500 else ''}")
                     else:
                         print(f"{GREEN}✓{RESET} {DIM}{result[:500]}{'...' if len(result) > 500 else ''}{RESET}")
+                        # Track last successfully read file
+                        if name == "read_file" and args.get("path"):
+                            last_file_read = args["path"]
                 else:
                     result = "Tool execution skipped by user"
                     print(f"{YELLOW}○ skipped{RESET}")
@@ -544,16 +606,31 @@ def agent_loop(task: str, config: dict) -> bool:
                     "role": "tool",
                     "content": result
                 })
+
+                # Boost reasoning after successful file read to help analyze content
+                if name == "read_file" and not result.startswith("Error"):
+                    messages.append({
+                        "role": "user",
+                        "content": "Reasoning: high\nAnalyze this file carefully and determine the exact change needed to complete the task."
+                    })
         else:
-            # No tool calls - check if model is asking a question
-            if looks_like_question(full_content) and reprompt_count < max_reprompts:
+            # No tool calls - check if model described changes without using tools
+            if looks_like_code_suggestion(full_content) and reprompt_count < max_reprompts:
+                reprompt_count += 1
+                print(f"{DIM}↻ prompting to use edit_file ({reprompt_count}/{max_reprompts})...{RESET}")
+                file_hint = f" The file you read was: {last_file_read}" if last_file_read else ""
+                messages.append({
+                    "role": "user",
+                    "content": f"You described a code change but did not call edit_file. Describing changes does NOT modify the file. You MUST call edit_file with path, old_string (exact text to replace), and new_string (replacement).{file_hint} Do it now."
+                })
+            # Check if model is asking a question
+            elif looks_like_question(full_content) and reprompt_count < max_reprompts:
                 reprompt_count += 1
                 print(f"{DIM}↻ continuing autonomously ({reprompt_count}/{max_reprompts})...{RESET}")
                 messages.append({
                     "role": "user",
                     "content": "Continue working on the task autonomously. Don't ask for input - make reasonable choices and proceed with the next step."
                 })
-                # Continue the loop instead of breaking
             else:
                 # Truly done or max reprompts reached
                 break
