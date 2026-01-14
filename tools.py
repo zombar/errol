@@ -384,7 +384,8 @@ def run_bash(command: str = None, timeout: int = 120, cwd: str = None, cmd: str 
 
 # Directories to always exclude from glob results
 GLOB_EXCLUDES = {'venv', 'node_modules', '__pycache__', '.git', '.venv', 'env', '.env',
-                 'dist', 'build', '.tox', '.pytest_cache', '.mypy_cache', 'eggs', '*.egg-info'}
+                 'dist', 'build', '.tox', '.pytest_cache', '.mypy_cache', 'eggs', '*.egg-info',
+                 '.errol'}
 
 def glob_files(pattern: str = None, path: str = ".") -> str:
     """Find files matching a glob pattern."""
