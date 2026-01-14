@@ -2,7 +2,9 @@ ollama:
   host: http://localhost:11434
   timeout: 300
 
-model: gpt-oss:20b
+models:
+  planning: mistral-small3.2:24b
+  writing: gpt-oss:20b
 
 agent:
   max_turns: 75

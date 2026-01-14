@@ -96,11 +96,19 @@ ollama:
   timeout: 300
 
 models:
-  small: gpt-oss:20b
-  medium: gpt-oss:20b
-  large: gpt-oss:20b
+  planning: mistral-small3.2:24b  # Good at creating multi-step plans
+  writing: gpt-oss:20b            # Executes the plan, writes code
 
 agent:
   max_turns: 75
-  show_model_picker: false
 ```
+
+### Recommended Models
+
+| Model | Size | Notes |
+|-------|------|-------|
+| devstral-small-2:24b | 24B | Good at multi-step planning, tool calls |
+| gpt-oss:20b | 20B | General purpose |
+| qwen2.5-coder:32b | 32B | Strong coding ability |
+
+Pull models with: `ollama pull <model-name>`

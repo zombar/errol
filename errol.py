@@ -266,7 +266,8 @@ def parse_python_tool_call(text: str) -> list[dict]:
                         args = parsed
                 except:
                     # Fallback: manual parsing for key='value' patterns
-                    for part in re.finditer(r"(\w+)\s*=\s*['\"](.+?)['\"]", args_str, re.DOTALL):
+                    # Use [^'"]* to allow empty strings and avoid matching across quotes
+                    for part in re.finditer(r"(\w+)\s*=\s*['\"]([^'\"]*)['\"]", args_str):
                         key, value = part.groups()
                         # Clean up the value
                         value = value.strip().replace('\n', ' ').replace('  ', ' ')
@@ -693,19 +694,24 @@ Current working directory: {cwd}
 {{"name": "todo", "parameters": {{"action": "add", "content": "string", "parent_id": "{root_id}", "file_path": "string", "anchor": "string"}}}}
 
 ## Your Task:
-1. Use glob/grep/read_file to understand the codebase
-2. Create a todo for EACH implementation step using: todo(action="add", content="...", parent_id="{root_id}", file_path="...", anchor="...")
+1. First, use glob/grep/read_file to understand the codebase (skip if empty project)
+2. Then, create ALL todos in a SINGLE response - call todo() multiple times, once for each implementation step
 3. Stop after creating todos - do NOT write code or suggest implementations
 
+If the project is empty (no files found), skip exploration and immediately create todos for all required files.
+
 ## CRITICAL RULES:
+- Create ALL todos in ONE response - do not wait for feedback between todos
+- Call todo() multiple times in the same response for multi-step tasks
 - Do NOT output code blocks or patches
 - Do NOT describe what code should look like
-- ONLY call tools - create todos for each step
 - Each todo must have file_path (the file to modify) and anchor (function/class name)
 
-## Example:
-User: "Add a save feature"
-You: 1. glob to find relevant files, 2. read_file to understand structure, 3. todo(action="add", content="Add save() method to Game class", file_path="game.py", anchor="class Game", parent_id="{root_id}")
+## Example (multi-step task):
+User: "Add save and load features"
+You call BOTH todos in one response:
+- todo(action="add", content="Add save() method", file_path="game.py", anchor="class Game", parent_id="{root_id}")
+- todo(action="add", content="Add load() method", file_path="game.py", anchor="class Game", parent_id="{root_id}")
 
 After creating ALL todos, say "Plan complete. Type 'approve' to execute."
 """
@@ -920,8 +926,12 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
         print("Error: Ollama not available. Start it with: ollama serve")
         return False
 
-    # Check configured model is available
-    model = config["model"]
+    # Select model based on mode (supports both old 'model' and new 'models' config)
+    if "models" in config:
+        model = config["models"].get("planning" if tracker.mode == "planning" else "writing")
+    else:
+        model = config.get("model")  # Backward compatibility
+
     available = client.list_models()
     if model not in available:
         print(f"Warning: Model '{model}' not found")
@@ -959,18 +969,39 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
     # Use restored messages if resuming, otherwise start fresh
     if resume and tracker.messages:
         messages = tracker.messages
+        # Update system prompt if mode changed (e.g., planning -> write)
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = system
+        # In write mode, inject instruction to execute the plan (only once)
+        if tracker.mode == "write" and tracker.tasks:
+            last_user_msg = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+            already_injected = last_user_msg and "Plan approved" in last_user_msg.get("content", "")
+            if not already_injected:
+                subtasks = [t for t in tracker.tasks if t.get("parent_id")]
+                if subtasks:
+                    task_list = "\n".join(f"- [{t['id']}] {t['content']} @ {t.get('file_path', '?')}" for t in subtasks)
+                    messages.append({
+                        "role": "user",
+                        "content": f"Plan approved. Now implement these tasks in order:\n{task_list}\n\nStart with the FIRST task. Use write_file to create new files. After completing each task, call todo(action='complete', task_id='<id>') to mark it done. Do NOT create new tasks."
+                    })
     else:
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": clean_task}
         ]
 
-    tools = get_tool_schemas()
+    # In write mode, exclude todo tool to force actual implementation
+    all_tools = get_tool_schemas()
+    if tracker.mode == "write":
+        tools = [t for t in all_tools if t["function"]["name"] != "todo"]
+    else:
+        tools = all_tools
     max_turns = config["agent"]["max_turns"]
     timer = Timer()
     reprompt_count = 0
     max_reprompts = 5
     last_file_read = None  # Track last file for context in prompts
+    tool_call_cache = {}  # Track glob/grep calls to prevent duplicates: cache_key -> result
 
     for turn in range(max_turns):
         # Get response (non-streaming for reliable tool calls)
@@ -1073,6 +1104,20 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                 # Resolve tool name (alias or fuzzy match) for consistent checks
                 name, _ = resolve_tool_name(original_name)
 
+                # Check for duplicate glob/grep calls
+                if name in ("glob", "grep"):
+                    try:
+                        cache_key = (name, json.dumps(args, sort_keys=True))
+                    except:
+                        cache_key = (name, str(args))
+                    if cache_key in tool_call_cache:
+                        print(f"\n{DIM}{'─'*60}{RESET}")
+                        print(f"{CYAN}◆{RESET} {name}")
+                        print(f"{DIM}{'─'*60}{RESET}")
+                        print(f"{YELLOW}○ skipped (duplicate call){RESET}")
+                        messages.append({"role": "tool", "content": tool_call_cache[cache_key]})
+                        continue
+
                 # Enforce planning mode - block write operations
                 if tracker.mode == "planning" and name in ("edit_file", "write_file", "bash"):
                     print(f"\n{DIM}{'─'*60}{RESET}")
@@ -1102,6 +1147,23 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                         # Track last successfully read file
                         if name == "read_file" and args.get("path"):
                             last_file_read = args["path"]
+                        # Cache glob/grep results for deduplication
+                        if name in ("glob", "grep"):
+                            try:
+                                cache_key = (name, json.dumps(args, sort_keys=True))
+                            except:
+                                cache_key = (name, str(args))
+                            tool_call_cache[cache_key] = result
+                        # Show next task after completing one
+                        if name == "todo" and args.get("action") == "complete":
+                            next_task = None
+                            for t in tracker.tasks:
+                                if t.get("parent_id") and t["status"] in ("pending", "in_progress"):
+                                    next_task = t
+                                    break
+                            if next_task:
+                                print(f"\n{DIM}{'─'*60}{RESET}")
+                                print(f"{YELLOW}→{RESET} Task {next_task['id']}: {next_task['content']}")
                 else:
                     result = "Tool execution skipped by user"
                     print(f"{YELLOW}○ skipped{RESET}")
@@ -1113,7 +1175,8 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                 })
 
                 # Inject focused task reminder - tell LLM exactly what to do next
-                if tracker.has_tasks() and name != "todo" and tracker.mode == "write":
+                # Include after todo(complete) to guide to next task
+                if tracker.has_tasks() and tracker.mode == "write":
                     # Find the next pending or in-progress subtask
                     next_task = None
                     for t in tracker.tasks:
@@ -1121,14 +1184,25 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                             next_task = t
                             break
                     if next_task:
+                        file_path = next_task.get("file_path")
+                        file_exists = file_path and os.path.exists(file_path)
+
                         location = ""
-                        if next_task.get("file_path"):
-                            location = f" in {next_task['file_path']}"
+                        if file_path:
+                            location = f" in {file_path}"
                             if next_task.get("anchor"):
                                 location += f" at {next_task['anchor']}"
+
+                        if file_exists:
+                            action = "Use edit_file to modify this file."
+                        elif file_path:
+                            action = f"Use write_file to CREATE {file_path}."
+                        else:
+                            action = "Use the appropriate tool to complete this task."
+
                         messages.append({
                             "role": "user",
-                            "content": f"NEXT TASK: {next_task['content']}{location}\n\nUse edit_file to make this change now. Task ID: {next_task['id']}"
+                            "content": f"NEXT TASK: {next_task['content']}{location}\n\n{action} When done, call todo(action='complete', task_id='{next_task['id']}')."
                         })
 
                 if name == "read_file" and not result.startswith("Error") and tracker.mode == "planning":
@@ -1141,7 +1215,13 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
             if tracker.mode == "planning" and show_plan_summary(tracker):
                 break
         else:
-            # No tool calls - check if model described changes without using tools
+            # No tool calls - check if all tasks are done (don't reprompt if complete)
+            pending_subtasks = [t for t in tracker.tasks if t.get("parent_id") and t["status"] != "completed"]
+            if not pending_subtasks and tracker.has_tasks():
+                # All planned tasks completed - allow model to finish
+                break
+
+            # Check if model described changes without using tools
             if looks_like_code_suggestion(full_content) and reprompt_count < max_reprompts:
                 reprompt_count += 1
 
@@ -1189,11 +1269,25 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
         tracker.save()
         print(f"{DIM}State saved. Type 'continue' to resume.{RESET}")
     else:
-        # Task completed normally - mark root task complete and clear session
-        for task in tracker.list():
-            if task.get("parent_id") is None and task["status"] == "in_progress":
-                tracker.set_status(task["id"], "completed")
-        clear_saved_session()
+        # Check if all subtasks are completed
+        pending_subtasks = [t for t in tracker.tasks if t.get("parent_id") and t["status"] != "completed"]
+        if pending_subtasks:
+            # Still have pending work - save state for continuation
+            print(f"\n{YELLOW}⚠ {len(pending_subtasks)} tasks remaining:{RESET}")
+            for t in pending_subtasks[:3]:
+                print(f"  {DIM}- {t['content']}{RESET}")
+            if len(pending_subtasks) > 3:
+                print(f"  {DIM}... and {len(pending_subtasks) - 3} more{RESET}")
+            tracker.messages = messages
+            tracker.interrupted = True
+            tracker.save()
+            print(f"{DIM}State saved. Type 'continue' to resume.{RESET}")
+        else:
+            # All tasks completed - mark root complete and clear session
+            for task in tracker.list():
+                if task.get("parent_id") is None and task["status"] == "in_progress":
+                    tracker.set_status(task["id"], "completed")
+            clear_saved_session()
 
     return False
 
@@ -1230,14 +1324,25 @@ def models():
     client = OllamaClient(host=config["ollama"]["host"])
 
     if not client.is_available():
-        print("Error: Ollama not available")
+        print(f"{RED}✗ Ollama not available{RESET}")
         return
 
-    print("Available models:")
-    for m in client.list_models():
-        print(f"  - {m}")
+    print(f"\n{MAGENTA}▶ errol{RESET} {DIM}models{RESET}")
 
-    print(f"\nConfigured model: {config['model']}")
+    print(f"\n{CYAN}◆{RESET} Available")
+    for m in client.list_models():
+        print(f"  {DIM}{m}{RESET}")
+
+    if "models" in config:
+        print(f"\n{CYAN}◆{RESET} Configured")
+        planning = config['models'].get('planning', 'not set')
+        writing = config['models'].get('writing', 'not set')
+        print(f"  {DIM}planning:{RESET} {planning}")
+        print(f"  {DIM}writing:{RESET}  {writing}")
+    else:
+        configured = config.get('model', 'not set')
+        print(f"\n{CYAN}◆{RESET} Configured")
+        print(f"  {DIM}model:{RESET} {configured}")
 
 
 @app.command()
