@@ -694,17 +694,19 @@ Current working directory: {cwd}
 {{"name": "todo", "parameters": {{"action": "add", "content": "string", "parent_id": "{root_id}", "file_path": "string", "anchor": "string"}}}}
 
 ## Your Task:
-1. First, use glob/grep/read_file to understand the codebase (skip if empty project)
-2. Then, create ALL todos in a SINGLE response - call todo() multiple times, once for each implementation step
-3. Stop after creating todos - do NOT write code or suggest implementations
+1. First, use glob to find existing files in the project
+2. IMPORTANT: If files exist, you MUST read them with read_file BEFORE creating todos - understand existing implementation first!
+3. Then, create ALL todos in a SINGLE response - call todo() multiple times, once for each step
+4. Stop after creating todos - do NOT write code or suggest implementations
 
-If the project is empty (no files found), skip exploration and immediately create todos for all required files.
+If the project is empty (no files found), skip exploration and immediately create todos.
 
 ## CRITICAL RULES:
+- ALWAYS read existing relevant files before planning - don't ignore partial implementations!
+- Keep plans CONCISE: aim for 3-5 high-level tasks, not 10+ granular steps
+- Group related work into single tasks (e.g., "Implement Snake class with movement" not 4 separate tasks)
 - Create ALL todos in ONE response - do not wait for feedback between todos
-- Call todo() multiple times in the same response for multi-step tasks
 - Do NOT output code blocks or patches
-- Do NOT describe what code should look like
 - Each todo must have file_path (the file to modify) and anchor (function/class name)
 
 ## Example (multi-step task):
@@ -714,6 +716,39 @@ You call BOTH todos in one response:
 - todo(action="add", content="Add load() method", file_path="game.py", anchor="class Game", parent_id="{root_id}")
 
 After creating ALL todos, say "Plan complete. Type 'approve' to execute."
+"""
+
+VALIDATION_PROMPT = """You are Errol in VALIDATION MODE. Check code for correctness.
+
+Current working directory: {cwd}
+
+## Task Completed
+{completed_task}
+
+## Files Modified
+{modified_files}
+
+## Your Task:
+1. Read the modified files using read_file
+2. Check for:
+   - Syntax errors (missing brackets, invalid syntax)
+   - Type issues (wrong argument types, undefined variables)
+   - Logical errors (off-by-one, null checks, infinite loops)
+   - Import/dependency issues
+3. Run tests or linters with bash if helpful (e.g., python -m py_compile file.py)
+
+## Available Tools (ONLY these 4):
+{{"name": "read_file", "parameters": {{"path": "string", "offset": "int (optional)", "limit": "int (optional)"}}}}
+{{"name": "bash", "parameters": {{"command": "string", "timeout": "int (optional)"}}}}
+{{"name": "grep", "parameters": {{"pattern": "string", "path": "string (optional)"}}}}
+{{"name": "glob", "parameters": {{"pattern": "string", "path": "string (optional)"}}}}
+
+## Output Format:
+After analysis, clearly state ONE of:
+- ISSUES FOUND: [list issues with file:line references]
+- NO ISSUES FOUND
+
+Do NOT suggest fixes yet - just identify issues. The user will decide whether to fix them.
 """
 
 def load_config() -> dict:
@@ -887,11 +922,43 @@ def confirm_tool(name: str, args: dict) -> bool:
 
     return confirm in ("y", "yes")
 
-def show_plan_summary(tracker) -> bool:
-    """Show plan summary if subtasks exist. Returns True if plan is complete."""
+def show_plan_summary(tracker, max_todos: int = None) -> tuple:
+    """Show plan summary if subtasks exist.
+
+    Returns tuple: (plan_complete: bool, needs_consolidation: bool, preferred_count: int or None)
+    """
     subtasks = [t for t in tracker.tasks if t.get("parent_id")]
     if not subtasks:
-        return False
+        return (False, False, None)
+
+    # Check if too many todos
+    if max_todos and len(subtasks) > max_todos:
+        print(f"\n{YELLOW}⚠ {len(subtasks)} tasks created (max: {max_todos}){RESET}")
+        for i, task in enumerate(subtasks, 1):
+            location = ""
+            if task.get("file_path") or task.get("anchor"):
+                parts = []
+                if task.get("file_path"):
+                    parts.append(task["file_path"])
+                if task.get("anchor"):
+                    parts.append(task["anchor"])
+                location = f" {DIM}@ {':'.join(parts)}{RESET}"
+            print(f"  {i}. {task['content']}{location}")
+
+        # Ask user for preferred count
+        print(f"\n{CYAN}How many steps would you prefer?{RESET}")
+        try:
+            user_input = input(f"Enter a number (or press Enter to keep {len(subtasks)}): ").strip()
+            if user_input.isdigit() and int(user_input) < len(subtasks):
+                preferred = int(user_input)
+                # Clear existing subtasks so LLM can recreate
+                tracker.tasks = [t for t in tracker.tasks if not t.get("parent_id")]
+                print(f"{DIM}Asking LLM to consolidate into {preferred} steps...{RESET}")
+                return (False, True, preferred)
+        except (EOFError, KeyboardInterrupt):
+            pass
+        # User accepted current count
+        print(f"\n{GREEN}✓ Keeping {len(subtasks)} steps{RESET}")
 
     print(f"\n{GREEN}✓ Plan created with {len(subtasks)} steps:{RESET}")
     for i, task in enumerate(subtasks, 1):
@@ -905,7 +972,153 @@ def show_plan_summary(tracker) -> bool:
             location = f" {DIM}@ {':'.join(parts)}{RESET}"
         print(f"  {i}. {task['content']}{location}")
     print(f"\n{DIM}Type 'approve' to execute the plan.{RESET}")
+    return (True, False, None)
+
+
+def run_validation_stage(completed_task: dict, modified_files: list[str],
+                         config: dict, tracker, messages: list) -> bool:
+    """Run validation stage after task completion.
+
+    Args:
+        completed_task: The completed task dict
+        modified_files: List of file paths modified during the task
+        config: Configuration dict
+        tracker: TaskTracker instance
+        messages: Current conversation messages
+
+    Returns:
+        True if validation passed or user accepted, False if user wants to fix
+    """
+    if not modified_files:
+        return True  # Nothing to validate
+
+    print(f"\n{CYAN}◆ Validating task: {completed_task.get('content', 'unknown')[:50]}...{RESET}")
+
+    # Build validation prompt
+    system = VALIDATION_PROMPT.format(
+        cwd=os.getcwd(),
+        completed_task=completed_task.get('content', ''),
+        modified_files="\n".join(f"- {f}" for f in modified_files)
+    )
+
+    # Create validation-specific messages
+    val_messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"Validate the changes made for: {completed_task.get('content', '')}"}
+    ]
+
+    # Run validation with LLM
+    client = OllamaClient(
+        host=config["ollama"]["host"],
+        timeout=config["ollama"]["timeout"]
+    )
+
+    # Use validation model if configured, otherwise use writing model
+    validation_config = config.get("agent", {}).get("validation", {})
+    model = validation_config.get("model") or config["models"].get("writing")
+
+    # Save current mode
+    previous_mode = tracker.mode
+    tracker.mode = "validation"
+
+    # Mini agent loop for validation (max 5 turns)
+    issues_found = None
+    issues_summary = ""
+    timer = Timer()
+
+    for _ in range(5):
+        timer.start()
+        try:
+            response = client.chat_sync(
+                model=model,
+                messages=val_messages,
+                tools=get_tool_schemas()
+            )
+        except Exception as e:
+            timer.stop()
+            print(f"{RED}✗ Validation error: {e}{RESET}")
+            break
+        timer.stop()
+        elapsed = time.time() - timer.start_time
+
+        content = response.get("message", {}).get("content", "")
+        tool_calls = response.get("message", {}).get("tool_calls", [])
+
+        # Check for issues in content
+        if "ISSUES FOUND:" in content.upper():
+            issues_found = True
+            # Extract issues summary (everything after ISSUES FOUND:)
+            idx = content.upper().find("ISSUES FOUND:")
+            issues_summary = content[idx:].strip()
+            break
+        elif "NO ISSUES FOUND" in content.upper():
+            issues_found = False
+            break
+
+        # Execute read-only tools
+        if tool_calls:
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                name = func.get("name", "")
+                args = func.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except:
+                        args = {}
+
+                # Only allow read-only tools + bash (for linters/tests)
+                print(f"\n{DIM}{'─'*60}{RESET}")
+                print(f"{CYAN}◆{RESET} {DIM}[validation]{RESET} {name}")
+                if args:
+                    print(json.dumps(args, indent=2))
+                print(f"{DIM}{'─'*60}{RESET}")
+
+                if name in ("read_file", "glob", "grep", "bash"):
+                    result = execute_tool(name, args)
+                    if result.startswith("Error"):
+                        print(f"{RED}✗{RESET} {result[:500]}{'...' if len(result) > 500 else ''}")
+                    else:
+                        print(f"{GREEN}✓{RESET} {DIM}{result[:200]}{'...' if len(result) > 200 else ''}{RESET}")
+                else:
+                    result = f"Error: Tool '{name}' not available in validation mode"
+                    print(f"{RED}✗{RESET} {result}")
+
+                val_messages.append({"role": "assistant", "content": content, "tool_calls": [tc]})
+                val_messages.append({"role": "tool", "content": result})
+        else:
+            # No tool calls and no issues determination - add to messages and continue
+            val_messages.append({"role": "assistant", "content": content})
+            val_messages.append({"role": "user", "content": "Please check the modified files and report: ISSUES FOUND: [list] or NO ISSUES FOUND"})
+
+    # Restore mode
+    tracker.mode = previous_mode
+
+    if issues_found is True:
+        print(f"\n{YELLOW}⚠ Validation found issues:{RESET}")
+        print(f"{DIM}{issues_summary}{RESET}")
+
+        try:
+            response = input(f"\n{YELLOW}Fix issues?{RESET} [y/N/skip]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            response = "n"
+
+        if response in ("y", "yes"):
+            # Add fix request to messages for the main loop to handle
+            messages.append({
+                "role": "user",
+                "content": f"VALIDATION ISSUES FOUND:\n{issues_summary}\n\nPlease fix these issues before proceeding to the next task."
+            })
+            return False  # Signal to continue fixing
+        else:
+            print(f"{DIM}Skipping validation fixes.{RESET}")
+    elif issues_found is False:
+        print(f"{GREEN}✓ Validation passed{RESET}")
+    else:
+        print(f"{DIM}Validation inconclusive, continuing...{RESET}")
+
     return True
+
 
 def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
     """Main agent execution loop. Returns True if cancelled by ESC."""
@@ -997,6 +1210,7 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
     else:
         tools = all_tools
     max_turns = config["agent"]["max_turns"]
+    max_todos = config["agent"].get("max_todos")  # Optional limit on todo items
     timer = Timer()
     reprompt_count = 0
     max_reprompts = 5
@@ -1147,6 +1361,9 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                         # Track last successfully read file
                         if name == "read_file" and args.get("path"):
                             last_file_read = args["path"]
+                        # Track file modifications for validation
+                        if name in ("write_file", "edit_file") and args.get("path"):
+                            tracker.add_modified_file(args["path"])
                         # Cache glob/grep results for deduplication
                         if name in ("glob", "grep"):
                             try:
@@ -1154,8 +1371,40 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                             except:
                                 cache_key = (name, str(args))
                             tool_call_cache[cache_key] = result
-                        # Show next task after completing one
+                            # In planning mode, prompt to read existing files before creating todos
+                            if tracker.mode == "planning" and name == "glob" and result and not result.startswith("No"):
+                                # Extract file paths from glob result
+                                files_found = [f.strip() for f in result.strip().split('\n') if f.strip()]
+                                if files_found:
+                                    # Check if any todos already created - if so, don't re-prompt
+                                    subtasks = [t for t in tracker.tasks if t.get("parent_id")]
+                                    if not subtasks:
+                                        messages.append({
+                                            "role": "user",
+                                            "content": f"Found existing files: {', '.join(files_found[:5])}. IMPORTANT: Read these files BEFORE creating todos to understand existing implementation. Use read_file on relevant files first."
+                                        })
+                        # Run validation and show next task after completing one
                         if name == "todo" and args.get("action") == "complete":
+                            completed_task = tracker.get(args.get("task_id"))
+                            modified_files = tracker.get_modified_files()
+
+                            # Run validation if there are modified files
+                            validation_enabled = config.get("agent", {}).get("validation", {}).get("enabled", True)
+                            if modified_files and validation_enabled and tracker.mode == "write":
+                                validation_passed = run_validation_stage(
+                                    completed_task or {"content": "unknown"},
+                                    modified_files,
+                                    config,
+                                    tracker,
+                                    messages
+                                )
+                                if not validation_passed:
+                                    # User wants to fix - don't clear files, continue loop
+                                    continue
+
+                            # Clear modified files after validation
+                            tracker.clear_modified_files()
+
                             next_task = None
                             for t in tracker.tasks:
                                 if t.get("parent_id") and t["status"] in ("pending", "in_progress"):
@@ -1212,8 +1461,15 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                     })
 
             # After processing all tool calls, check if plan is complete
-            if tracker.mode == "planning" and show_plan_summary(tracker):
-                break
+            if tracker.mode == "planning":
+                plan_complete, needs_consolidation, preferred_count = show_plan_summary(tracker, max_todos)
+                if needs_consolidation:
+                    messages.append({
+                        "role": "user",
+                        "content": f"The plan has too many steps. Please consolidate into exactly {preferred_count} high-level tasks. Call todo(action='add', ...) for each consolidated step."
+                    })
+                elif plan_complete:
+                    break
         else:
             # No tool calls - check if all tasks are done (don't reprompt if complete)
             pending_subtasks = [t for t in tracker.tasks if t.get("parent_id") and t["status"] != "completed"]
@@ -1227,7 +1483,14 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
 
                 # In planning mode: force todo creation, don't prompt for edits
                 if tracker.mode == "planning":
-                    if show_plan_summary(tracker):
+                    plan_complete, needs_consolidation, preferred_count = show_plan_summary(tracker, max_todos)
+                    if needs_consolidation:
+                        messages.append({
+                            "role": "user",
+                            "content": f"The plan has too many steps. Please consolidate into exactly {preferred_count} high-level tasks. Call todo(action='add', ...) for each consolidated step."
+                        })
+                        continue
+                    elif plan_complete:
                         break
                     # No subtasks yet - prompt to create them
                     print(f"{DIM}↻ prompting to create todos (planning mode) ({reprompt_count}/{max_reprompts})...{RESET}")
@@ -1378,10 +1641,14 @@ def self_check():
     from test_task_tracker import run_all_tests as run_tracker_tests
     tracker_results = run_tracker_tests()
 
+    print(f"\n{CYAN}◆{RESET} {BOLD}Unit Tests (validation){RESET}")
+    from test_validation import run_all_tests as run_validation_tests
+    validation_results = run_validation_tests()
+
     # Combine results
-    total_passed = results.passed + tracker_results.passed
-    total_failed = results.failed + tracker_results.failed
-    all_errors = results.errors + tracker_results.errors
+    total_passed = results.passed + tracker_results.passed + validation_results.passed
+    total_failed = results.failed + tracker_results.failed + validation_results.failed
+    all_errors = results.errors + tracker_results.errors + validation_results.errors
 
     if total_failed > 0:
         print(f"\n{RED}✗{RESET} {total_passed} passed, {total_failed} failed")

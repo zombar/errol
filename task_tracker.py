@@ -13,15 +13,16 @@ class TaskTracker:
     """
 
     VALID_STATUSES = {"pending", "in_progress", "completed"}
-    VALID_MODES = {"planning", "write"}
+    VALID_MODES = {"planning", "write", "validation"}
 
     def __init__(self):
         self.tasks = []  # List of {id, content, active_form, status, parent_id}
         self.original_task = ""  # The user's original request
         self.messages = []  # Conversation history for resumption
         self.interrupted = False  # Whether session was interrupted
-        self.mode = "planning"  # planning or write
+        self.mode = "planning"  # planning, write, or validation
         self.plan_path = Path(".errol/PLAN.md")
+        self.current_task_files = []  # Files modified during current task
 
     def add(self, content: str, active_form: str = None, parent_id: str = None,
             file_path: str = None, anchor: str = None) -> str:
@@ -151,6 +152,19 @@ class TaskTracker:
                 del self.tasks[i]
                 return True
         return False
+
+    def add_modified_file(self, file_path: str):
+        """Track a file modified during current task."""
+        if file_path and file_path not in self.current_task_files:
+            self.current_task_files.append(file_path)
+
+    def get_modified_files(self):
+        """Get list of files modified during current task."""
+        return self.current_task_files.copy()
+
+    def clear_modified_files(self):
+        """Clear the modified files list (after validation)."""
+        self.current_task_files = []
 
     def save(self, path: Path = None):
         """Save state to disk. Also regenerates PLAN.md."""

@@ -697,6 +697,14 @@ def validate_tool_call(name: str, args: dict) -> Optional[str]:
         available = ", ".join(TOOLS.keys())
         return f"Unknown tool '{name}'. Available tools: {available}"
 
+    # Check required parameters
+    tool_info = TOOLS.get(resolved_name, {})
+    schema = tool_info.get("schema", {}).get("function", {}).get("parameters", {})
+    required = schema.get("required", [])
+    for param in required:
+        if param not in args or args.get(param) in (None, ""):
+            return f"'{param}' parameter is required"
+
     # Check for placeholders
     for key, val in args.items():
         if isinstance(val, str) and re.search(r'<[a-zA-Z_-]+>', val):

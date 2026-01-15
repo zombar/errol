@@ -8,3 +8,7 @@ models:
 
 agent:
   max_turns: 75
+  max_todos: 5  # Max todo items before asking user for preferred count
+  validation:
+    enabled: true  # Run validation after each task completion
+    model: null    # Use specific model for validation (null = use writing model)
