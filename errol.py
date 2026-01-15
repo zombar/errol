@@ -975,6 +975,84 @@ def show_plan_summary(tracker, max_todos: int = None) -> tuple:
     return (True, False, None)
 
 
+def parse_validation_issues(issues_summary: str, modified_files: list[str] = None) -> list[dict]:
+    """Parse validation issues summary into individual fix tasks.
+
+    Args:
+        issues_summary: The raw issues text from validation (e.g., "ISSUES FOUND:\n- **Line 53** – ...")
+        modified_files: List of files that were modified (used to infer file_path)
+
+    Returns:
+        List of dicts with 'content', 'active_form', and optionally 'file_path', 'anchor'
+    """
+    issues = []
+
+    # Infer file path from modified files (use first .py file if available)
+    default_file = None
+    if modified_files:
+        for f in modified_files:
+            if f.endswith('.py'):
+                default_file = f
+                break
+        if not default_file:
+            default_file = modified_files[0]
+
+    # Match markdown list items: "- **Label** – description" or "- **Label**: description"
+    # Handle both en-dash (–) and colon (:) as delimiters
+    pattern = r'-\s*\*\*([^*]+)\*\*\s*[–:\-]\s*(.+?)(?=\n-\s*\*\*|\n\n|$)'
+    matches = re.findall(pattern, issues_summary, re.DOTALL)
+
+    for label, description in matches:
+        label = label.strip()
+        desc = description.strip()
+        # Remove any trailing markdown or extra newlines
+        desc = re.sub(r'\s+', ' ', desc)
+
+        # Extract line numbers from label (e.g., "Line 53" or "Lines 94–99")
+        line_match = re.search(r'[Ll]ines?\s*(\d+)', label)
+        line_hint = f" (line {line_match.group(1)})" if line_match else ""
+
+        # Extract function/method name from description (e.g., `Board.is_mine()`)
+        anchor = None
+        func_match = re.search(r'`(\w+\.\w+)\(`', desc)
+        if func_match:
+            anchor = func_match.group(1)
+
+        # Truncate description for content
+        if len(desc) > 120:
+            desc = desc[:117] + "..."
+
+        content = f"Fix{line_hint}: {desc}"
+        active_form = f"Fixing issue at {label.lower()}"
+
+        issue = {"content": content, "active_form": active_form}
+        if default_file:
+            issue["file_path"] = default_file
+        if anchor:
+            issue["anchor"] = anchor
+        issues.append(issue)
+
+    # If no structured issues found, try simpler parsing (plain list items)
+    if not issues:
+        lines = issues_summary.split('\n')
+        for line in lines:
+            line = line.strip()
+            if line.startswith('- ') and len(line) > 3:
+                desc = line[2:].strip()
+                if desc and not desc.upper().startswith('ISSUES FOUND'):
+                    if len(desc) > 150:
+                        desc = desc[:147] + "..."
+                    issue = {
+                        "content": f"Fix: {desc}",
+                        "active_form": "Fixing validation issue"
+                    }
+                    if default_file:
+                        issue["file_path"] = default_file
+                    issues.append(issue)
+
+    return issues
+
+
 def run_validation_stage(completed_task: dict, modified_files: list[str],
                          config: dict, tracker, messages: list) -> bool:
     """Run validation stage after task completion.
@@ -1071,7 +1149,7 @@ def run_validation_stage(completed_task: dict, modified_files: list[str],
                 print(f"\n{DIM}{'─'*60}{RESET}")
                 print(f"{CYAN}◆{RESET} {DIM}[validation]{RESET} {name}")
                 if args:
-                    print(json.dumps(args, indent=2))
+                    print(f"{DIM}{json.dumps(args, indent=2)}{RESET}")
                 print(f"{DIM}{'─'*60}{RESET}")
 
                 if name in ("read_file", "glob", "grep", "bash"):
@@ -1104,11 +1182,49 @@ def run_validation_stage(completed_task: dict, modified_files: list[str],
             response = "n"
 
         if response in ("y", "yes"):
-            # Add fix request to messages for the main loop to handle
-            messages.append({
-                "role": "user",
-                "content": f"VALIDATION ISSUES FOUND:\n{issues_summary}\n\nPlease fix these issues before proceeding to the next task."
-            })
+            # Parse issues and create subtasks
+            parsed_issues = parse_validation_issues(issues_summary, modified_files)
+
+            if parsed_issues:
+                print(f"\n{CYAN}Creating {len(parsed_issues)} fix subtask(s):{RESET}")
+                parent_id = completed_task.get("id")
+
+                created_task_ids = []
+                for issue in parsed_issues:
+                    task_id = tracker.add(
+                        content=issue["content"],
+                        active_form=issue["active_form"],
+                        parent_id=parent_id,
+                        file_path=issue.get("file_path"),
+                        anchor=issue.get("anchor")
+                    )
+                    created_task_ids.append(task_id)
+                    file_hint = f" @ {issue.get('file_path', '')}" if issue.get('file_path') else ""
+                    print(f"  {DIM}+ [{task_id}] {issue['content'][:50]}...{file_hint}{RESET}")
+
+                # Add context message for the LLM with explicit instructions
+                first_task_id = created_task_ids[0] if created_task_ids else "..."
+                first_file = parsed_issues[0].get("file_path", "the file") if parsed_issues else "the file"
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"VALIDATION ISSUES FOUND:\n{issues_summary}\n\n"
+                        f"{len(parsed_issues)} FIX SUBTASKS ALREADY CREATED - DO NOT create new subtasks.\n\n"
+                        f"Execute each fix subtask in order. For each one:\n"
+                        f"1. todo(action='start', task_id='{first_task_id}') - mark in_progress\n"
+                        f"2. read_file(path='{first_file}') - read the code first\n"
+                        f"3. edit_file(path='...', old_string='<exact text from file>', new_string='<fixed code>')\n"
+                        f"4. todo(action='complete', task_id='...') - mark done\n\n"
+                        f"CRITICAL: You MUST read_file BEFORE edit_file. The old_string must be copied exactly from the file."
+                    )
+                })
+            else:
+                # Fallback if parsing fails - use generic fix request
+                messages.append({
+                    "role": "user",
+                    "content": f"VALIDATION ISSUES FOUND:\n{issues_summary}\n\nPlease fix these issues before proceeding to the next task."
+                })
+
             return False  # Signal to continue fixing
         else:
             print(f"{DIM}Skipping validation fixes.{RESET}")

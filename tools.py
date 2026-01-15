@@ -701,9 +701,14 @@ def validate_tool_call(name: str, args: dict) -> Optional[str]:
     tool_info = TOOLS.get(resolved_name, {})
     schema = tool_info.get("schema", {}).get("function", {}).get("parameters", {})
     required = schema.get("required", [])
-    for param in required:
-        if param not in args or args.get(param) in (None, ""):
-            return f"'{param}' parameter is required"
+    missing = [p for p in required if p not in args or args.get(p) in (None, "")]
+    if missing:
+        # Provide helpful error for edit_file
+        if resolved_name == "edit_file":
+            return (f"edit_file requires: path, old_string, new_string. "
+                    f"Missing: {', '.join(missing)}. "
+                    f"old_string is the exact text to find, new_string is the replacement.")
+        return f"'{missing[0]}' parameter is required"
 
     # Check for placeholders
     for key, val in args.items():
