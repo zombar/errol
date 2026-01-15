@@ -774,11 +774,43 @@ def preview_file_change(name: str, args: dict) -> str:
     if name == "edit_file" and p.exists() and p.is_file():
         from tools import _find_match, _adjust_replacement_indent
         old_string = args.get("old_string", "")
-        new_string = args.get("new_string", "")
+        new_string = args.get("new_string", "") or ""
         replace_all = args.get("replace_all", False)
+        line_start = args.get("line_start")
+        line_end = args.get("line_end")
+
+        content = p.read_text()
+
+        # Handle line-based selection - direct replacement without _find_match
+        if line_start is not None or line_end is not None:
+            lines = content.splitlines(keepends=True)
+            if not lines:
+                return f"{RED}File is empty{RESET}"
+            # Convert to int if string
+            if isinstance(line_start, str):
+                line_start = int(line_start)
+            if isinstance(line_end, str):
+                line_end = int(line_end)
+            # Defaults
+            if line_start is None:
+                line_start = 1
+            if line_end is None:
+                line_end = line_start
+            # Clamp to valid range
+            line_start = max(1, min(line_start, len(lines)))
+            line_end = max(line_start, min(line_end, len(lines)))
+            # Build new content directly
+            before = ''.join(lines[:line_start - 1])
+            after = ''.join(lines[line_end:])
+            # Ensure new_string ends with newline if replacing lines that had one
+            if lines[line_end - 1].endswith('\n') and new_string and not new_string.endswith('\n'):
+                new_string = new_string + '\n'
+            new_content = before + new_string + after
+            suffix = f"\n{DIM}(lines {line_start}-{line_end}){RESET}"
+            return show_diff(content, new_content, p.name) + suffix
+
         if not old_string:
             return ""
-        content = p.read_text()
         m = _find_match(content, old_string, new_string)
 
         if m['type'] == 'flexible':
@@ -1110,7 +1142,8 @@ def run_validation_stage(completed_task: dict, modified_files: list[str],
             response = client.chat_sync(
                 model=model,
                 messages=val_messages,
-                tools=get_tool_schemas()
+                tools=get_tool_schemas(),
+                options={"temperature": 0.0, "num_ctx": 32768}
             )
         except Exception as e:
             timer.stop()
@@ -1340,7 +1373,8 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
 
         timer.start()
         try:
-            response = client.chat_sync(model, messages, tools=tools)
+            response = client.chat_sync(model, messages, tools=tools,
+                                        options={"temperature": 0.0, "num_ctx": 32768})
         except KeyboardInterrupt:
             timer.stop()
             # Save state for continuation
@@ -1355,7 +1389,8 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
             if "error parsing tool call" in error_str or "500" in error_str:
                 print(f"{YELLOW}⚠ Ollama tool parsing failed, retrying without tools...{RESET}")
                 try:
-                    response = client.chat_sync(model, messages, tools=None)
+                    response = client.chat_sync(model, messages, tools=None,
+                                                options={"temperature": 0.0, "num_ctx": 32768})
                 except KeyboardInterrupt:
                     timer.stop()
                     # Save state for continuation
@@ -1408,7 +1443,10 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                     print(f"  {line}")
 
         # Add assistant message to history
+        # Critical for gpt-oss: pass reasoning_content back to maintain chain-of-thought
         assistant_msg = {"role": "assistant", "content": full_content}
+        if reasoning:
+            assistant_msg["reasoning_content"] = reasoning
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
         messages.append(assistant_msg)
@@ -1459,6 +1497,11 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                     messages.append({"role": "tool", "content": result})
                     continue
 
+                # Capture task info before execution (task gets removed on complete)
+                completing_task = None
+                if name == "todo" and args.get("action") == "complete":
+                    completing_task = tracker.get(args.get("task_id"))
+
                 # Validate before prompting
                 validation_error = validate_tool_call(name, args)
                 if validation_error:
@@ -1499,36 +1542,40 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                                             "role": "user",
                                             "content": f"Found existing files: {', '.join(files_found[:5])}. IMPORTANT: Read these files BEFORE creating todos to understand existing implementation. Use read_file on relevant files first."
                                         })
-                        # Run validation and show next task after completing one
+                        # Show next task after completing one, run validation only when all done
                         if name == "todo" and args.get("action") == "complete":
-                            completed_task = tracker.get(args.get("task_id"))
-                            modified_files = tracker.get_modified_files()
+                            # Check for remaining subtasks (completed tasks are now removed)
+                            remaining_subtasks = [t for t in tracker.tasks if t.get("parent_id")]
+                            next_task = remaining_subtasks[0] if remaining_subtasks else None
 
-                            # Run validation if there are modified files
-                            validation_enabled = config.get("agent", {}).get("validation", {}).get("enabled", True)
-                            if modified_files and validation_enabled and tracker.mode == "write":
-                                validation_passed = run_validation_stage(
-                                    completed_task or {"content": "unknown"},
-                                    modified_files,
-                                    config,
-                                    tracker,
-                                    messages
-                                )
-                                if not validation_passed:
-                                    # User wants to fix - don't clear files, continue loop
-                                    continue
-
-                            # Clear modified files after validation
-                            tracker.clear_modified_files()
-
-                            next_task = None
-                            for t in tracker.tasks:
-                                if t.get("parent_id") and t["status"] in ("pending", "in_progress"):
-                                    next_task = t
-                                    break
                             if next_task:
+                                # More tasks remain - show next task, don't validate yet
                                 print(f"\n{DIM}{'─'*60}{RESET}")
                                 print(f"{YELLOW}→{RESET} Task {next_task['id']}: {next_task['content']}")
+                            else:
+                                # All subtasks complete - run validation on all modified files
+                                modified_files = tracker.get_modified_files()
+                                validation_enabled = config.get("agent", {}).get("validation", {}).get("enabled", True)
+                                if modified_files and validation_enabled and tracker.mode == "write":
+                                    # Get root task for validation context
+                                    root_task = None
+                                    for t in tracker.tasks:
+                                        if not t.get("parent_id"):
+                                            root_task = t
+                                            break
+                                    validation_passed = run_validation_stage(
+                                        root_task or {"content": "all tasks"},
+                                        modified_files,
+                                        config,
+                                        tracker,
+                                        messages
+                                    )
+                                    if not validation_passed:
+                                        # User wants to fix - don't clear files, continue loop
+                                        continue
+
+                                # Clear modified files after validation
+                                tracker.clear_modified_files()
                 else:
                     result = "Tool execution skipped by user"
                     print(f"{YELLOW}○ skipped{RESET}")
@@ -1587,9 +1634,9 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                 elif plan_complete:
                     break
         else:
-            # No tool calls - check if all tasks are done (don't reprompt if complete)
-            pending_subtasks = [t for t in tracker.tasks if t.get("parent_id") and t["status"] != "completed"]
-            if not pending_subtasks and tracker.has_tasks():
+            # No tool calls - check if all tasks are done (completed tasks are removed)
+            remaining_subtasks = [t for t in tracker.tasks if t.get("parent_id")]
+            if not remaining_subtasks and tracker.has_tasks():
                 # All planned tasks completed - allow model to finish
                 break
 
@@ -1648,24 +1695,24 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
         tracker.save()
         print(f"{DIM}State saved. Type 'continue' to resume.{RESET}")
     else:
-        # Check if all subtasks are completed
-        pending_subtasks = [t for t in tracker.tasks if t.get("parent_id") and t["status"] != "completed"]
-        if pending_subtasks:
+        # Check if all subtasks are completed (completed tasks are removed)
+        remaining_subtasks = [t for t in tracker.tasks if t.get("parent_id")]
+        if remaining_subtasks:
             # Still have pending work - save state for continuation
-            print(f"\n{YELLOW}⚠ {len(pending_subtasks)} tasks remaining:{RESET}")
-            for t in pending_subtasks[:3]:
+            print(f"\n{YELLOW}⚠ {len(remaining_subtasks)} tasks remaining:{RESET}")
+            for t in remaining_subtasks[:3]:
                 print(f"  {DIM}- {t['content']}{RESET}")
-            if len(pending_subtasks) > 3:
-                print(f"  {DIM}... and {len(pending_subtasks) - 3} more{RESET}")
+            if len(remaining_subtasks) > 3:
+                print(f"  {DIM}... and {len(remaining_subtasks) - 3} more{RESET}")
             tracker.messages = messages
             tracker.interrupted = True
             tracker.save()
             print(f"{DIM}State saved. Type 'continue' to resume.{RESET}")
         else:
-            # All tasks completed - mark root complete and clear session
+            # All tasks completed - remove root task and clear session
             for task in tracker.list():
-                if task.get("parent_id") is None and task["status"] == "in_progress":
-                    tracker.set_status(task["id"], "completed")
+                if task.get("parent_id") is None:
+                    tracker.remove(task["id"])
             clear_saved_session()
 
     return False

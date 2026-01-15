@@ -22,7 +22,12 @@ PARAM_ALIASES = {
     "glob": {"query": "pattern", "search": "pattern", "name": "pattern"},
     "read_file": {"file": "path", "filename": "path", "file_path": "path"},
     "write_file": {"file": "path", "filename": "path", "file_path": "path"},
-    "edit_file": {"file": "path", "filename": "path", "file_path": "path"},
+    "edit_file": {
+        "file": "path", "filename": "path", "file_path": "path",
+        "old_text": "old_string", "new_text": "new_string",
+        "start_line": "line_start", "end_line": "line_end",
+        "content": "new_string",  # When used with line selectors
+    },
 }
 
 # Tool aliases - map common alternative names to canonical tool names
@@ -292,23 +297,66 @@ def _adjust_replacement_indent(new_string: str, original_match: str) -> str:
 
     return '\n'.join(result)
 
-def edit_file(path: str = None, old_string: str = None, new_string: str = None, replace_all: bool = False) -> str:
-    """Replace old_string with new_string in file."""
+def edit_file(path: str = None, old_string: str = None, new_string: str = None,
+              replace_all: bool = False, line_start: int = None, line_end: int = None) -> str:
+    """Replace old_string with new_string in file.
+
+    Supports two modes:
+    1. String-based: old_string and new_string are provided directly
+    2. Line-based: line_start and line_end select the text to replace, new_string is the replacement
+    """
     try:
         if not path:
             return "Error: 'path' parameter is required"
         path = path.strip()
+        p = Path(path).expanduser().resolve()
+        if not p.exists():
+            return f"Error: File not found: {path}"
+
+        content = p.read_text()
+        lines = content.splitlines(keepends=True)
+
+        # Handle line-based selection
+        if line_start is not None or line_end is not None:
+            # Convert to int if string
+            if isinstance(line_start, str):
+                line_start = int(line_start)
+            if isinstance(line_end, str):
+                line_end = int(line_end)
+
+            # Default values
+            if line_start is None:
+                line_start = 1
+            if line_end is None:
+                line_end = line_start
+
+            # Validate line numbers (1-indexed)
+            if line_start < 1 or line_end < 1:
+                return f"Error: Line numbers must be >= 1 (got start={line_start}, end={line_end})"
+            if line_start > len(lines):
+                return f"Error: line_start ({line_start}) exceeds file length ({len(lines)} lines)"
+            if line_end > len(lines):
+                line_end = len(lines)  # Clamp to file length
+            if line_start > line_end:
+                return f"Error: line_start ({line_start}) > line_end ({line_end})"
+
+            # Extract old_string from the specified lines (convert to 0-indexed)
+            old_string = ''.join(lines[line_start - 1:line_end])
+
+            if new_string is None:
+                return f"Error: 'new_string' (or 'content') parameter is required for line-based edit"
+
+            # Ensure new_string ends with newline if old_string did
+            if old_string.endswith('\n') and not new_string.endswith('\n'):
+                new_string = new_string + '\n'
+
+        # Standard string-based validation
         if old_string is None:
             return "Error: 'old_string' parameter is required (the text to find and replace)"
         if new_string is None:
             return "Error: 'new_string' parameter is required (the replacement text)"
         if old_string == new_string:
             return "Error: old_string and new_string are identical - no change needed"
-        p = Path(path).expanduser().resolve()
-        if not p.exists():
-            return f"Error: File not found: {path}"
-
-        content = p.read_text()
         m = _find_match(content, old_string, new_string)
 
         if m['type'] == 'flexible':
@@ -509,8 +557,12 @@ def todo_tool(action: str = None, content: str = None, active_form: str = None,
     elif action == "complete":
         if not task_id:
             return "Error: 'task_id' parameter is required for 'complete' action"
-        if tracker.set_status(task_id, "completed"):
-            return f"Task {task_id} marked as completed"
+        # Get task info before removing
+        task = tracker.get(task_id)
+        if task:
+            content = task.get("content", "")[:50]
+            tracker.remove(task_id)
+            return f"Task {task_id} completed and removed: {content}"
         return f"Error: Task '{task_id}' not found"
 
     else:
@@ -562,16 +614,18 @@ TOOLS = {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Replace a string in a file with new content. String must be unique unless replace_all=true.",
+                "description": "Replace text in a file. Two modes: (1) String-based: provide old_string and new_string. (2) Line-based: provide line_start/line_end to select lines, and new_string as replacement.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": {"type": "string", "description": "File path"},
-                        "old_string": {"type": "string", "description": "String to find"},
+                        "old_string": {"type": "string", "description": "String to find (for string-based mode)"},
                         "new_string": {"type": "string", "description": "Replacement string"},
-                        "replace_all": {"type": "boolean", "description": "Replace all occurrences (default false, requires unique match)"}
+                        "replace_all": {"type": "boolean", "description": "Replace all occurrences (default false)"},
+                        "line_start": {"type": "integer", "description": "Starting line number (1-indexed, for line-based mode)"},
+                        "line_end": {"type": "integer", "description": "Ending line number inclusive (1-indexed, for line-based mode)"}
                     },
-                    "required": ["path", "old_string", "new_string"]
+                    "required": ["path"]
                 }
             }
         }
@@ -702,12 +756,24 @@ def validate_tool_call(name: str, args: dict) -> Optional[str]:
     schema = tool_info.get("schema", {}).get("function", {}).get("parameters", {})
     required = schema.get("required", [])
     missing = [p for p in required if p not in args or args.get(p) in (None, "")]
-    if missing:
-        # Provide helpful error for edit_file
-        if resolved_name == "edit_file":
+
+    # Special handling for edit_file - line-based mode has different requirements
+    if resolved_name == "edit_file":
+        has_line_selector = args.get("line_start") is not None or args.get("line_end") is not None
+        if has_line_selector:
+            # Line-based mode: needs path and new_string (or content)
+            if not args.get("path"):
+                return "edit_file requires: path"
+            if args.get("new_string") is None and args.get("content") is None:
+                return "edit_file with line selection requires: new_string (or content) for the replacement text"
+            missing = []  # Clear missing - we've done our own validation
+        elif missing:
             return (f"edit_file requires: path, old_string, new_string. "
                     f"Missing: {', '.join(missing)}. "
-                    f"old_string is the exact text to find, new_string is the replacement.")
+                    f"old_string is the exact text to find, new_string is the replacement. "
+                    f"Alternatively, use line_start/line_end to select text by line numbers.")
+
+    if missing:
         return f"'{missing[0]}' parameter is required"
 
     # Check for placeholders
@@ -715,22 +781,42 @@ def validate_tool_call(name: str, args: dict) -> Optional[str]:
         if isinstance(val, str) and re.search(r'<[a-zA-Z_-]+>', val):
             return f"Placeholder detected in '{key}': {val}. Use actual values."
 
-    # Validate edit_file: check string exists
+    # Validate edit_file: check string exists (skip for line-based mode)
     if resolved_name == "edit_file":
         path = args.get("path", "")
         old_string = args.get("old_string", "")
-        if path and old_string:
+        has_line_selector = args.get("line_start") is not None or args.get("line_end") is not None
+
+        if path:
             p = Path(path).expanduser().resolve()
             if not p.exists():
                 return f"File not found: {path}"
-            try:
-                content = p.read_text()
-                m = _find_match(content, old_string)
-                if m['type'] is None:
-                    first_line = old_string.split('\n')[0][:80]
-                    return f"String not found in {path}. Looking for: {first_line!r}"
-            except Exception as e:
-                return f"Cannot read file: {e}"
+
+            # For line-based mode, validate line numbers
+            if has_line_selector:
+                try:
+                    content = p.read_text()
+                    num_lines = len(content.splitlines())
+                    line_start = args.get("line_start", 1)
+                    line_end = args.get("line_end", line_start)
+                    if isinstance(line_start, str):
+                        line_start = int(line_start)
+                    if isinstance(line_end, str):
+                        line_end = int(line_end)
+                    if line_start > num_lines:
+                        return f"line_start ({line_start}) exceeds file length ({num_lines} lines)"
+                except Exception as e:
+                    return f"Cannot read file: {e}"
+            # For string-based mode, validate string exists
+            elif old_string:
+                try:
+                    content = p.read_text()
+                    m = _find_match(content, old_string)
+                    if m['type'] is None:
+                        first_line = old_string.split('\n')[0][:80]
+                        return f"String not found in {path}. Looking for: {first_line!r}"
+                except Exception as e:
+                    return f"Cannot read file: {e}"
 
     # Validate read_file: check file exists
     if resolved_name == "read_file":

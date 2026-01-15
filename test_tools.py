@@ -87,30 +87,77 @@ def test_write_file_missing_path(r: TestResults):
 
 
 def test_edit_file_missing_old_string(r: TestResults):
-    """edit_file should return error when old_string is missing."""
-    result = edit_file(path="/tmp/test.txt", new_string="new")
-    if "Error" in result and "old_string" in result.lower():
-        r.ok("edit_file_missing_old_string")
-    else:
-        r.fail("edit_file_missing_old_string", f"Expected error about old_string, got: {result}")
+    """edit_file should return error when old_string is missing (with real file)."""
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write("hello world\n")
+        tmp_path = f.name
+    try:
+        result = edit_file(path=tmp_path, new_string="new")
+        if "Error" in result and "old_string" in result.lower():
+            r.ok("edit_file_missing_old_string")
+        else:
+            r.fail("edit_file_missing_old_string", f"Expected error about old_string, got: {result}")
+    finally:
+        import os
+        os.unlink(tmp_path)
 
 
 def test_edit_file_missing_new_string(r: TestResults):
-    """edit_file should return error when new_string is missing."""
-    result = edit_file(path="/tmp/test.txt", old_string="old")
-    if "Error" in result and "new_string" in result.lower():
-        r.ok("edit_file_missing_new_string")
-    else:
-        r.fail("edit_file_missing_new_string", f"Expected error about new_string, got: {result}")
+    """edit_file should return error when new_string is missing (with real file)."""
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write("hello world\n")
+        tmp_path = f.name
+    try:
+        result = edit_file(path=tmp_path, old_string="hello")
+        if "Error" in result and "new_string" in result.lower():
+            r.ok("edit_file_missing_new_string")
+        else:
+            r.fail("edit_file_missing_new_string", f"Expected error about new_string, got: {result}")
+    finally:
+        import os
+        os.unlink(tmp_path)
 
 
 def test_edit_file_identical_strings(r: TestResults):
-    """edit_file should return error when old_string equals new_string."""
-    result = edit_file(path="/tmp/test.txt", old_string="same", new_string="same")
-    if "Error" in result and "identical" in result.lower():
-        r.ok("edit_file_identical_strings")
-    else:
-        r.fail("edit_file_identical_strings", f"Expected error about identical, got: {result}")
+    """edit_file should return error when old_string equals new_string (with real file)."""
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write("same content here\n")
+        tmp_path = f.name
+    try:
+        result = edit_file(path=tmp_path, old_string="same", new_string="same")
+        if "Error" in result and "identical" in result.lower():
+            r.ok("edit_file_identical_strings")
+        else:
+            r.fail("edit_file_identical_strings", f"Expected error about identical, got: {result}")
+    finally:
+        import os
+        os.unlink(tmp_path)
+
+
+def test_edit_file_line_based(r: TestResults):
+    """edit_file should support line_start/line_end selection."""
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        f.write("line 1\nline 2\nline 3\n")
+        tmp_path = f.name
+    try:
+        result = edit_file(path=tmp_path, line_start=2, line_end=2, new_string="replaced line 2\n")
+        if "Edited" in result or "applied" in result.lower():
+            # Verify the content
+            with open(tmp_path) as f:
+                content = f.read()
+            if "replaced line 2" in content and "line 1" in content and "line 3" in content:
+                r.ok("edit_file_line_based")
+            else:
+                r.fail("edit_file_line_based", f"Content not as expected: {content}")
+        else:
+            r.fail("edit_file_line_based", f"Expected success, got: {result}")
+    finally:
+        import os
+        os.unlink(tmp_path)
 
 
 def test_bash_missing_command(r: TestResults):
@@ -432,6 +479,7 @@ def run_all_tests() -> TestResults:
     test_edit_file_missing_old_string(r)
     test_edit_file_missing_new_string(r)
     test_edit_file_identical_strings(r)
+    test_edit_file_line_based(r)
     test_bash_missing_command(r)
     test_bash_cmd_alias(r)
     test_bash_string_timeout(r)
