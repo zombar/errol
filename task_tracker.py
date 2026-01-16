@@ -13,19 +13,20 @@ class TaskTracker:
     """
 
     VALID_STATUSES = {"pending", "in_progress", "completed"}
-    VALID_MODES = {"planning", "write", "validation"}
+    VALID_MODES = {"planning", "todo", "write", "validation"}
 
     def __init__(self):
-        self.tasks = []  # List of {id, content, active_form, status, parent_id}
+        self.tasks = []  # List of {id, content, active_form, status, parent_id, specification}
         self.original_task = ""  # The user's original request
         self.messages = []  # Conversation history for resumption
         self.interrupted = False  # Whether session was interrupted
         self.mode = "planning"  # planning, write, or validation
         self.plan_path = Path(".errol/PLAN.md")
         self.current_task_files = []  # Files modified during current task
+        self.enriched_plan = ""  # Stores detailed implementation plan from shot 1
 
     def add(self, content: str, active_form: str = None, parent_id: str = None,
-            file_path: str = None, anchor: str = None) -> str:
+            file_path: str = None, anchor: str = None, specification: str = None) -> str:
         """Add a new task. If parent_id given, insert after parent and its subtasks.
 
         Args:
@@ -34,6 +35,7 @@ class TaskTracker:
             parent_id: Parent task ID for subtasks
             file_path: Optional file path this task affects
             anchor: Optional semantic anchor (function/class name) for locating edit
+            specification: Task-specific implementation details (signature, integration points)
         """
         # Check for duplicate task with same content and parent
         for task in self.tasks:
@@ -48,7 +50,8 @@ class TaskTracker:
             "status": "pending",
             "parent_id": parent_id,
             "file_path": file_path,
-            "anchor": anchor
+            "anchor": anchor,
+            "specification": specification
         }
 
         if parent_id:
@@ -166,6 +169,12 @@ class TaskTracker:
         """Clear the modified files list (after validation)."""
         self.current_task_files = []
 
+    def write_enriched_plan(self, plan_content: str):
+        """Write the enriched implementation plan to PLAN.md (shot 1 output)."""
+        self.plan_path.parent.mkdir(parents=True, exist_ok=True)
+        self.plan_path.write_text(plan_content)
+        self.enriched_plan = plan_content
+
     def save(self, path: Path = None):
         """Save state to disk. Also regenerates PLAN.md."""
         path = path or Path(".errol") / "last_session.json"
@@ -176,12 +185,15 @@ class TaskTracker:
             "original_task": self.original_task,
             "messages": self.messages,
             "interrupted": self.interrupted,
-            "mode": self.mode
+            "mode": self.mode,
+            "enriched_plan": self.enriched_plan
         }
         path.write_text(json.dumps(data, indent=2))
 
-        # Regenerate PLAN.md from tasks
-        if self.original_task:
+        # Write enriched plan if available, otherwise regenerate from tasks
+        if self.enriched_plan:
+            self.write_enriched_plan(self.enriched_plan)
+        elif self.original_task:
             self.write_plan(self.original_task)
 
     def load(self, path: Path = None) -> bool:
@@ -197,6 +209,7 @@ class TaskTracker:
             self.messages = data.get("messages", [])
             self.interrupted = data.get("interrupted", False)
             self.mode = data.get("mode", "planning")
+            self.enriched_plan = data.get("enriched_plan", "")
             return True
         except (json.JSONDecodeError, IOError):
             return False

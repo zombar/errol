@@ -1,6 +1,6 @@
 ollama:
   host: http://localhost:11434
-  timeout: 300
+  timeout: 900
 
 models:
   planning: mistral-small3.2:24b

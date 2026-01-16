@@ -509,18 +509,19 @@ def grep(pattern: str = None, path: str = ".", include: str = None) -> str:
 
 def todo_tool(action: str = None, content: str = None, active_form: str = None,
               task_id: str = None, parent_id: str = None,
-              file_path: str = None, anchor: str = None) -> str:
+              file_path: str = None, anchor: str = None, specification: str = None) -> str:
     """Manage task tracking for multi-step work.
 
     Actions:
     - list: Show all tasks with status
-    - add: Add a new task (requires content, optionally active_form, parent_id, file_path, anchor)
+    - add: Add a new task (requires content, optionally active_form, parent_id, file_path, anchor, specification)
     - start: Mark task as in_progress (requires task_id)
     - complete: Mark task as completed (requires task_id)
 
     For 'add' action:
     - file_path: Optional file path this task affects
     - anchor: Optional semantic anchor (function/class name) for locating the edit
+    - specification: Task-specific implementation details (signature, integration points, patterns)
     """
     tracker = get_tracker()
 
@@ -537,7 +538,7 @@ def todo_tool(action: str = None, content: str = None, active_form: str = None,
     elif action == "add":
         if not content:
             return "Error: 'content' parameter is required for 'add' action"
-        new_task_id = tracker.add(content, active_form, parent_id, file_path, anchor)
+        new_task_id = tracker.add(content, active_form, parent_id, file_path, anchor, specification)
         # Build response with location info if provided
         location = ""
         if file_path or anchor:
@@ -691,7 +692,7 @@ TOOLS = {
             "type": "function",
             "function": {
                 "name": "todo",
-                "description": "Manage task tracking. Use this to track progress on multi-step tasks. Actions: list (show tasks), add (create task with optional parent_id for subtasks, file_path and anchor for location hints), start (mark in_progress), complete (mark done).",
+                "description": "Manage task tracking. Use this to track progress on multi-step tasks. Actions: list (show tasks), add (create task with optional parent_id for subtasks, file_path, anchor, and specification for implementation details), start (mark in_progress), complete (mark done).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -701,7 +702,8 @@ TOOLS = {
                         "task_id": {"type": "string", "description": "Task ID (for 'start' and 'complete' actions)"},
                         "parent_id": {"type": "string", "description": "Parent task ID to create a subtask (for 'add' action)"},
                         "file_path": {"type": "string", "description": "File path this task affects (for 'add' action)"},
-                        "anchor": {"type": "string", "description": "Semantic anchor like function/class name for locating the edit (for 'add' action)"}
+                        "anchor": {"type": "string", "description": "Semantic anchor like function/class name for locating the edit (for 'add' action)"},
+                        "specification": {"type": "string", "description": "Task-specific implementation details: method signature, integration points, patterns to follow (for 'add' action)"}
                     },
                     "required": ["action"]
                 }

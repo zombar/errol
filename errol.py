@@ -569,18 +569,29 @@ def main(ctx: typer.Context):
 
                 elif task_lower == "approve":
                     tracker = get_tracker()
-                    if tracker.mode == "planning":
-                        tracker.mode = "write"
-                        tracker.save()
-                        print(f"{GREEN}✓ Plan approved. Switching to write mode.{RESET}")
-                        # Automatically continue with the saved task
-                        if tracker.original_task:
-                            print(f"{DIM}Executing plan...{RESET}")
+                    if tracker.mode == "todo":
+                        subtasks = [t for t in tracker.tasks if t.get("parent_id")]
+
+                        if not subtasks:
+                            # No todos yet - extract from enriched plan
+                            print(f"{CYAN}◆ Extracting tasks from plan...{RESET}")
                             cancelled = agent_loop(tracker.original_task, config, resume=True)
                             if cancelled:
                                 continue
-                    else:
+                        else:
+                            # Have todos - approve them and switch to write mode
+                            tracker.mode = "write"
+                            tracker.save()
+                            print(f"{GREEN}✓ Tasks approved. Executing...{RESET}")
+                            cancelled = agent_loop(tracker.original_task, config, resume=True)
+                            if cancelled:
+                                continue
+                    elif tracker.mode == "planning":
+                        print(f"{YELLOW}Still generating plan. Please wait for completion.{RESET}")
+                    elif tracker.mode == "write":
                         print(f"{YELLOW}Already in write mode.{RESET}")
+                    else:
+                        print(f"{YELLOW}Nothing to approve.{RESET}")
                     continue
 
                 elif task_lower == "plan":
@@ -716,6 +727,81 @@ You call BOTH todos in one response:
 - todo(action="add", content="Add load() method", file_path="game.py", anchor="class Game", parent_id="{root_id}")
 
 After creating ALL todos, say "Plan complete. Type 'approve' to execute."
+"""
+
+# Enriched planning prompt - generates detailed implementation plan (shot 1)
+ENRICHED_PLAN_PROMPT = """You are Errol in PLANNING MODE. Your job is to create a DETAILED implementation plan.
+
+Current working directory: {cwd}
+
+## Available Tools (read-only):
+{{"name": "glob", "parameters": {{"pattern": "string", "path": "string (optional)"}}}}
+{{"name": "grep", "parameters": {{"pattern": "string", "path": "string (optional)"}}}}
+{{"name": "read_file", "parameters": {{"path": "string", "offset": "int (optional)", "limit": "int (optional)"}}}}
+
+## Your Process:
+1. FIRST: Run glob(pattern="**/*.py") ONCE to check if this is an existing project
+2. IF files exist: read relevant ones to understand patterns and conventions
+3. IF NO files exist (greenfield project): SKIP exploration entirely and proceed to step 4
+4. Output a DETAILED implementation plan in the format below
+
+IMPORTANT: For greenfield/empty projects, do NOT keep searching for files. After ONE glob returns "No files matched", immediately output the implementation plan.
+
+## Output Format:
+
+# Implementation Plan: [task summary]
+
+## Overview
+Brief description of what needs to be done.
+
+## Files to Create/Modify
+
+### [file_path]
+**Changes:**
+1. [change description] - `function_name(params) -> ReturnType`
+2. [change description] - `function_name(params) -> ReturnType`
+
+(Repeat for each file)
+
+## RULES:
+- Do NOT call the todo tool - output markdown only
+- Do NOT write implementation code
+- Include file paths and function signatures
+- Keep it concise
+"""
+
+# Todo extraction prompt - extracts todos from enriched plan (shot 2)
+TODO_EXTRACTION_PROMPT = """You are extracting structured todos from an implementation plan.
+
+## The Plan:
+{enriched_plan}
+
+## Your Task:
+Read the plan and create ONE todo for each discrete change needed. For each change:
+
+Call todo(action="add", content="...", file_path="...", anchor="...", specification="...", parent_id="{root_id}")
+
+## Rules for good todos:
+- content: Brief imperative description (e.g., "Add validate_input() method")
+- file_path: The exact file path from the plan
+- anchor: The function/class name where the change goes (e.g., "class UserModel" or "def process_request")
+- specification: Copy the relevant details from the plan - signature, integration points, patterns to follow
+- Keep todos atomic - one logical change per todo
+- Order todos by dependency (earlier todos should be done first)
+
+## Example:
+For a plan section like:
+  ### src/auth.py
+  **Changes Required:**
+  1. Add login() function
+     - Signature: `def login(email: str, password: str) -> Token`
+     - Integration: Import jwt from jose, call validate_password()
+
+You would call:
+todo(action="add", content="Add login function", file_path="src/auth.py", anchor="module level", specification="Signature: def login(email: str, password: str) -> Token. Import jwt from jose. Call validate_password() for password check.", parent_id="{root_id}")
+
+Now extract ALL todos from the plan. Call todo() for each one.
+After creating all todos, say "Todos extracted. Type 'approve' to execute."
 """
 
 VALIDATION_PROMPT = """You are Errol in VALIDATION MODE. Check code for correctness.
@@ -946,6 +1032,10 @@ def confirm_tool(name: str, args: dict) -> bool:
     # Auto-confirm read-only tools with countdown
     if name in READONLY_TOOLS:
         return countdown_confirm()
+
+    # Auto-confirm write tools with longer countdown (bash always requires manual approval)
+    if name in ("edit_file", "write_file"):
+        return countdown_confirm(10)
 
     try:
         confirm = input(f"{YELLOW}Execute?{RESET} [y/N]: ").strip().lower()
@@ -1288,9 +1378,14 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
         print("Error: Ollama not available. Start it with: ollama serve")
         return False
 
-    # Select model based on mode (supports both old 'model' and new 'models' config)
+    # Select model based on mode
     if "models" in config:
-        model = config["models"].get("planning" if tracker.mode == "planning" else "writing")
+        if tracker.mode == "planning":
+            model = config["models"].get("writing")  # prose generation
+        elif tracker.mode == "todo":
+            model = config["models"].get("planning")  # tool calling
+        else:
+            model = config["models"].get("writing")
     else:
         model = config.get("model")  # Backward compatibility
 
@@ -1322,14 +1417,25 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                 root_id = t["id"]
                 break
 
-    # Build system prompt - use focused PLANNING_PROMPT in planning mode
+    # Build system prompt based on mode
     if tracker.mode == "planning":
-        system = PLANNING_PROMPT.format(cwd=os.getcwd(), root_id=root_id)
+        system = ENRICHED_PLAN_PROMPT.format(cwd=os.getcwd())
+    elif tracker.mode == "todo":
+        system = TODO_EXTRACTION_PROMPT.format(
+            enriched_plan=tracker.enriched_plan,
+            root_id=root_id
+        )
     else:
         system = SYSTEM_PROMPT.format(cwd=os.getcwd(), reasoning_level=reasoning_level)
 
-    # Use restored messages if resuming, otherwise start fresh
-    if resume and tracker.messages:
+    # Build messages based on mode
+    # Todo mode always starts fresh - the enriched plan is in the system prompt
+    if tracker.mode == "todo":
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "Extract todos from the plan above. Call todo() for each change needed."}
+        ]
+    elif resume and tracker.messages:
         messages = tracker.messages
         # Update system prompt if mode changed (e.g., planning -> write)
         if messages and messages[0].get("role") == "system":
@@ -1352,12 +1458,18 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
             {"role": "user", "content": clean_task}
         ]
 
-    # In write mode, exclude todo tool to force actual implementation
+    # Select tools based on mode
     all_tools = get_tool_schemas()
-    if tracker.mode == "write":
-        tools = [t for t in all_tools if t["function"]["name"] != "todo"]
+    if tracker.mode == "planning":
+        # Planning mode: read-only exploration tools only
+        tools = [t for t in all_tools if t["function"]["name"] in ("glob", "grep", "read_file")]
+    elif tracker.mode == "todo":
+        # Todo mode: only the todo tool for extracting tasks
+        tools = [t for t in all_tools if t["function"]["name"] == "todo"]
     else:
+        # Write/validation modes: all tools (including todo for completing tasks)
         tools = all_tools
+    allowed_tool_names = {t["function"]["name"] for t in tools}
     max_turns = config["agent"]["max_turns"]
     max_todos = config["agent"].get("max_todos")  # Optional limit on todo items
     timer = Timer()
@@ -1415,13 +1527,31 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
         reasoning = msg.get("reasoning_content", "")
         tool_calls = msg.get("tool_calls", [])
 
+        # Filter out tool calls that aren't in the allowed tools for this mode
+        # (LLM may generate calls for tools it wasn't given)
+        ignored_tool_calls = []
+        if tool_calls:
+            filtered = []
+            for tc in tool_calls:
+                name = tc.get("function", {}).get("name", "")
+                if name in allowed_tool_names:
+                    filtered.append(tc)
+                else:
+                    ignored_tool_calls.append(name)
+                    print(f"{DIM}↻ ignoring disallowed tool call: {name}{RESET}")
+            tool_calls = filtered
+
         # Fallback: parse tool calls from text if model doesn't use native format
-        if not tool_calls and full_content:
-            tool_calls = parse_tool_calls_from_text(full_content)
+        # Skip in planning mode - we expect text output, not tool calls
+        if not tool_calls and full_content and tracker.mode != "planning":
+            parsed = parse_tool_calls_from_text(full_content)
+            # Also filter parsed tool calls
+            tool_calls = [tc for tc in parsed if tc.get("function", {}).get("name", "") in allowed_tool_names]
 
         # Fallback: gpt-oss sometimes puts tool calls in reasoning_content
-        if not tool_calls and reasoning:
-            tool_calls = parse_tool_calls_from_text(reasoning)
+        if not tool_calls and reasoning and tracker.mode != "planning":
+            parsed = parse_tool_calls_from_text(reasoning)
+            tool_calls = [tc for tc in parsed if tc.get("function", {}).get("name", "") in allowed_tool_names]
 
         # Store raw response for 'raw' command (always, even if only tool calls)
         store_raw_response(full_content, reasoning, tool_calls)
@@ -1441,6 +1571,16 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                 # Fallback if rich not installed
                 for line in cleaned.split("\n"):
                     print(f"  {line}")
+
+        # In planning mode, text output IS the enriched plan
+        if tracker.mode == "planning" and full_content.strip() and not tool_calls:
+            tracker.enriched_plan = full_content
+            tracker.write_enriched_plan(full_content)
+            tracker.mode = "todo"  # Transition to next stage
+            tracker.save()
+            print(f"\n{DIM}Plan saved to .errol/PLAN.md{RESET}")
+            print(f"{DIM}Type 'approve' to extract tasks.{RESET}")
+            break
 
         # Add assistant message to history
         # Critical for gpt-oss: pass reasoning_content back to maintain chain-of-thought
@@ -1472,8 +1612,8 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                 # Resolve tool name (alias or fuzzy match) for consistent checks
                 name, _ = resolve_tool_name(original_name)
 
-                # Check for duplicate glob/grep calls
-                if name in ("glob", "grep"):
+                # Check for duplicate glob/grep/read_file calls
+                if name in ("glob", "grep", "read_file"):
                     try:
                         cache_key = (name, json.dumps(args, sort_keys=True))
                     except:
@@ -1523,8 +1663,8 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                         # Track file modifications for validation
                         if name in ("write_file", "edit_file") and args.get("path"):
                             tracker.add_modified_file(args["path"])
-                        # Cache glob/grep results for deduplication
-                        if name in ("glob", "grep"):
+                        # Cache glob/grep/read_file results for deduplication
+                        if name in ("glob", "grep", "read_file"):
                             try:
                                 cache_key = (name, json.dumps(args, sort_keys=True))
                             except:
@@ -1612,9 +1752,13 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                         else:
                             action = "Use the appropriate tool to complete this task."
 
+                        # Include task-specific specification if available
+                        spec = next_task.get("specification", "")
+                        spec_context = f"\n\nSpecification:\n{spec}" if spec else ""
+
                         messages.append({
                             "role": "user",
-                            "content": f"NEXT TASK: {next_task['content']}{location}\n\n{action} When done, call todo(action='complete', task_id='{next_task['id']}')."
+                            "content": f"NEXT TASK: {next_task['content']}{location}{spec_context}\n\n{action} When done, call todo(action='complete', task_id='{next_task['id']}')."
                         })
 
                 if name == "read_file" and not result.startswith("Error") and tracker.mode == "planning":
@@ -1623,8 +1767,8 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                         "content": "Now create todos for each change needed. Use todo(action='add', ...) for each step."
                     })
 
-            # After processing all tool calls, check if plan is complete
-            if tracker.mode == "planning":
+            # After processing all tool calls, check if todos are complete
+            if tracker.mode == "todo":
                 plan_complete, needs_consolidation, preferred_count = show_plan_summary(tracker, max_todos)
                 if needs_consolidation:
                     messages.append({
@@ -1632,11 +1776,23 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                         "content": f"The plan has too many steps. Please consolidate into exactly {preferred_count} high-level tasks. Call todo(action='add', ...) for each consolidated step."
                     })
                 elif plan_complete:
+                    print(f"\n{DIM}Type 'approve' to execute these tasks.{RESET}")
                     break
         else:
+            # In planning mode, if we ignored tool calls (like todo), reprompt for text plan
+            if tracker.mode == "planning" and ignored_tool_calls and reprompt_count < max_reprompts:
+                reprompt_count += 1
+                print(f"{DIM}↻ prompting to output plan as text ({reprompt_count}/{max_reprompts})...{RESET}")
+                messages.append({
+                    "role": "user",
+                    "content": "In planning mode, you cannot use the todo tool. Instead, output a detailed implementation plan as markdown text. Include file paths, function signatures, and integration points. Start with '# Implementation Plan:' and describe each change needed."
+                })
+                continue
+
             # No tool calls - check if all tasks are done (completed tasks are removed)
+            # Skip this check in planning/todo modes where we're still building the plan
             remaining_subtasks = [t for t in tracker.tasks if t.get("parent_id")]
-            if not remaining_subtasks and tracker.has_tasks():
+            if not remaining_subtasks and tracker.has_tasks() and tracker.mode not in ("planning", "todo"):
                 # All planned tasks completed - allow model to finish
                 break
 
@@ -1644,8 +1800,8 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
             if looks_like_code_suggestion(full_content) and reprompt_count < max_reprompts:
                 reprompt_count += 1
 
-                # In planning mode: force todo creation, don't prompt for edits
-                if tracker.mode == "planning":
+                # In todo mode: force todo creation
+                if tracker.mode == "todo":
                     plan_complete, needs_consolidation, preferred_count = show_plan_summary(tracker, max_todos)
                     if needs_consolidation:
                         messages.append({
