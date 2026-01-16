@@ -1031,7 +1031,7 @@ def confirm_tool(name: str, args: dict) -> bool:
 
     # Auto-confirm read-only tools with countdown
     if name in READONLY_TOOLS:
-        return countdown_confirm()
+        return countdown_confirm(1)
 
     # Auto-confirm write tools with longer countdown (bash always requires manual approval)
     if name in ("edit_file", "write_file"):
@@ -1363,8 +1363,8 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
     """Main agent execution loop. Returns True if cancelled by ESC."""
     tracker = get_tracker()
 
-    # Only reset if not resuming a previous session
-    if not resume and not tracker.has_tasks():
+    # Always reset on new tasks to prevent context leaking from previous sessions
+    if not resume:
         reset_tracker()
         tracker = get_tracker()
 
@@ -1496,25 +1496,34 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
             print(f"\n{YELLOW}⚠ Interrupted - state saved. Type 'continue' to resume.{RESET}")
             return True  # Signal cancellation
         except Exception as e:
-            # If Ollama fails to parse tool calls, retry without tools
+            # If Ollama fails to parse tool calls, retry (error may be transient)
             error_str = str(e)
             if "error parsing tool call" in error_str or "500" in error_str:
-                print(f"{YELLOW}⚠ Ollama tool parsing failed, retrying without tools...{RESET}")
+                print(f"{YELLOW}⚠ Ollama tool parsing failed, retrying...{RESET}")
                 try:
-                    response = client.chat_sync(model, messages, tools=None,
+                    # First retry with tools (transient errors)
+                    response = client.chat_sync(model, messages, tools=tools,
                                                 options={"temperature": 0.0, "num_ctx": 32768})
                 except KeyboardInterrupt:
                     timer.stop()
-                    # Save state for continuation
                     tracker.messages = messages
                     tracker.interrupted = True
                     tracker.save()
                     print(f"\n{YELLOW}⚠ Interrupted - state saved. Type 'continue' to resume.{RESET}")
                     return True
                 except Exception as e2:
+                    # Both retries failed - inject guidance and continue to next iteration
                     timer.stop()
-                    print(f"{RED}✗ API error: {e2}{RESET}")
-                    break
+                    print(f"{YELLOW}⚠ Retry failed, prompting model to continue...{RESET}")
+                    messages.append({
+                        "role": "assistant",
+                        "content": "(Tool call failed due to parsing error)"
+                    })
+                    messages.append({
+                        "role": "user",
+                        "content": "Tool parsing failed. Please continue with the current task. Use the tool functions (read_file, edit_file, write_file, todo, etc.) to make progress. Call the tools properly with valid JSON arguments."
+                    })
+                    continue  # Try again with the guidance prompt
             else:
                 timer.stop()
                 print(f"{RED}✗ API error: {e}{RESET}")
@@ -1663,6 +1672,17 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                         # Track file modifications for validation
                         if name in ("write_file", "edit_file") and args.get("path"):
                             tracker.add_modified_file(args["path"])
+                            # Invalidate cached reads of this file so LLM re-reads fresh content
+                            edited_path = str(Path(args["path"]).expanduser().resolve())
+                            for key in list(tool_call_cache.keys()):
+                                if key[0] == "read_file":
+                                    try:
+                                        cached_args = json.loads(key[1])
+                                        cached_path = str(Path(cached_args.get("path", "")).expanduser().resolve())
+                                        if cached_path == edited_path:
+                                            del tool_call_cache[key]
+                                    except:
+                                        pass
                         # Cache glob/grep/read_file results for deduplication
                         if name in ("glob", "grep", "read_file"):
                             try:
@@ -1745,12 +1765,25 @@ def agent_loop(task: str, config: dict, resume: bool = False) -> bool:
                             if next_task.get("anchor"):
                                 location += f" at {next_task['anchor']}"
 
+                        # Infer task type from content to provide appropriate guidance
+                        task_lower = next_task['content'].lower()
+                        if any(kw in task_lower for kw in ('add ', 'create ', 'implement ', 'new ')):
+                            task_guidance = "Add this as NEW code. Do NOT replace or delete existing methods/functions."
+                        elif any(kw in task_lower for kw in ('remove ', 'delete ')):
+                            task_guidance = "Remove the specified code."
+                        elif any(kw in task_lower for kw in ('replace ', 'rewrite ')):
+                            task_guidance = "Replace the existing implementation entirely."
+                        elif any(kw in task_lower for kw in ('modify ', 'update ', 'change ', 'edit ', 'fix ')):
+                            task_guidance = "Modify the existing code. Keep the structure but update the implementation."
+                        else:
+                            task_guidance = "Make the required changes."
+
                         if file_exists:
-                            action = "Use edit_file to modify this file."
+                            action = f"Use edit_file to modify this file. {task_guidance}"
                         elif file_path:
                             action = f"Use write_file to CREATE {file_path}."
                         else:
-                            action = "Use the appropriate tool to complete this task."
+                            action = f"Use the appropriate tool. {task_guidance}"
 
                         # Include task-specific specification if available
                         spec = next_task.get("specification", "")
@@ -1964,10 +1997,14 @@ def self_check():
     from test_validation import run_all_tests as run_validation_tests
     validation_results = run_validation_tests()
 
+    print(f"\n{CYAN}◆{RESET} {BOLD}Unit Tests (cache){RESET}")
+    from test_cache import run_all_tests as run_cache_tests
+    cache_results = run_cache_tests()
+
     # Combine results
-    total_passed = results.passed + tracker_results.passed + validation_results.passed
-    total_failed = results.failed + tracker_results.failed + validation_results.failed
-    all_errors = results.errors + tracker_results.errors + validation_results.errors
+    total_passed = results.passed + tracker_results.passed + validation_results.passed + cache_results.passed
+    total_failed = results.failed + tracker_results.failed + validation_results.failed + cache_results.failed
+    all_errors = results.errors + tracker_results.errors + validation_results.errors + cache_results.errors
 
     if total_failed > 0:
         print(f"\n{RED}✗{RESET} {total_passed} passed, {total_failed} failed")

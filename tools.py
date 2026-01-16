@@ -297,6 +297,15 @@ def _adjust_replacement_indent(new_string: str, original_match: str) -> str:
 
     return '\n'.join(result)
 
+def _format_edit_result(path: str, content: str, new_content: str, suffix: str = "") -> str:
+    """Format edit result with diff for LLM context."""
+    import re
+    diff = show_diff(content, new_content, path)
+    # Strip ANSI color codes for LLM consumption
+    clean_diff = re.sub(r'\033\[[0-9;]*m', '', diff)
+    return f"Edited {path}: applied changes{suffix}\n\nChanges made:\n{clean_diff}"
+
+
 def edit_file(path: str = None, old_string: str = None, new_string: str = None,
               replace_all: bool = False, line_start: int = None, line_end: int = None) -> str:
     """Replace old_string with new_string in file.
@@ -364,7 +373,7 @@ def edit_file(path: str = None, old_string: str = None, new_string: str = None,
             adjusted_new = _adjust_replacement_indent(new_string, matched_text)
             new_content = content[:start] + adjusted_new + content[end:]
             p.write_text(new_content)
-            return f"Edited {path}: applied changes (flexible match)"
+            return _format_edit_result(path, content, new_content, " (flexible match)")
 
         if m['type'] is None:
             # Show first line and try to find similar content
@@ -391,7 +400,7 @@ def edit_file(path: str = None, old_string: str = None, new_string: str = None,
             replaced_msg = f" (first of {m['count']})" if m['count'] > 1 else ""
 
         p.write_text(new_content)
-        return f"Edited {path}: applied changes{replaced_msg}"
+        return _format_edit_result(path, content, new_content, replaced_msg)
     except Exception as e:
         return f"Error editing file: {e}"
 
